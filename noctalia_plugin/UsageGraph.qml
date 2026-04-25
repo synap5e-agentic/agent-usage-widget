@@ -95,6 +95,13 @@ Canvas {
     return coords;
   }
 
+  function paceLineTargetValue(valueKind, maxValue, referenceValue) {
+    if (valueKind === "percent" && referenceValue > 0 && referenceValue < maxValue) {
+      return referenceValue;
+    }
+    return maxValue;
+  }
+
   onPaint: {
     const ctx = getContext("2d");
     ctx.clearRect(0, 0, width, height);
@@ -109,6 +116,7 @@ Canvas {
     const rawPoints = graph.points;
     const valueKind = graph.value_kind || "percent";
     const maxValue = Math.max(1, Number(graph.max_value || (valueKind === "currency_cents" ? 100 : 100)));
+    const referenceValue = Number(graph.reference_value || 0);
     const showPaceLine = graph.pace_line !== false;
     const windowStart = graph.window_start ? new Date(graph.window_start).getTime() : NaN;
     const windowEnd = graph.window_end ? new Date(graph.window_end).getTime() : NaN;
@@ -136,6 +144,18 @@ Canvas {
       ctx.fillText(formatYAxisLabel(tickValue, maxValue, valueKind), pL - 4, y);
     }
 
+    if (valueKind === "percent" && referenceValue > 0 && referenceValue < maxValue) {
+      const refY = pT + pH * (1 - Math.max(0, Math.min(maxValue, referenceValue)) / maxValue);
+      ctx.strokeStyle = Qt.rgba(Color.mOnSurfaceVariant.r, Color.mOnSurfaceVariant.g, Color.mOnSurfaceVariant.b, 0.8);
+      ctx.setLineDash([5, 3]);
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(pL, refY);
+      ctx.lineTo(pL + pW, refY);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+
     ctx.textBaseline = "top";
     ctx.fillStyle = Color.mOnSurfaceVariant;
     ctx.textAlign = "left";
@@ -144,12 +164,14 @@ Canvas {
     ctx.fillText(formatEdgeLabel(maxTs, span), pL + pW, pT + pH + 6);
 
     if (windowEnd > windowStart && showPaceLine) {
+      const paceTarget = paceLineTargetValue(valueKind, maxValue, referenceValue);
+      const paceTargetY = pT + pH * (1 - Math.max(0, Math.min(maxValue, paceTarget)) / maxValue);
       ctx.strokeStyle = Qt.rgba(Color.mOutline.r, Color.mOutline.g, Color.mOutline.b, 0.65);
       ctx.setLineDash([4, 3]);
       ctx.lineWidth = 1.5;
       ctx.beginPath();
       ctx.moveTo(pL, pT + pH);
-      ctx.lineTo(pL + pW, pT);
+      ctx.lineTo(pL + pW, paceTargetY);
       ctx.stroke();
       ctx.setLineDash([]);
     }

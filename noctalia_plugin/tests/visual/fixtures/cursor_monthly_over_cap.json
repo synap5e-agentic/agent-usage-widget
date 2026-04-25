@@ -1,0 +1,22 @@
+{
+  "width": 420,
+  "height": 180,
+  "now_ms": 1775030400000,
+  "accent_color": "#f97316",
+  "graph": {
+    "label": "Monthly usage",
+    "metric_key": "monthly",
+    "value_kind": "percent",
+    "max_value": 150,
+    "reference_value": 100,
+    "window_start": "2026-04-01T00:00:00Z",
+    "window_end": "2026-05-01T00:00:00Z",
+    "pace_line": true,
+    "points": [
+      { "t": 1775005200, "value": 42 },
+      { "t": 1775012400, "value": 78 },
+      { "t": 1775026800, "value": 109 },
+      { "t": 1775030400, "value": 138 }
+    ]
+  }
+}

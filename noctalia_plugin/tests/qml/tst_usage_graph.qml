@@ -94,6 +94,17 @@ TestCase {
     graph.destroy();
   }
 
+  function test_pace_line_targets_reference_value_for_over_cap_percent_graphs() {
+    const graph = createGraph();
+
+    compare(graph.paceLineTargetValue("percent", 200, 100), 100);
+    compare(graph.paceLineTargetValue("percent", 100, 100), 100);
+    compare(graph.paceLineTargetValue("percent", 150, 0), 150);
+    compare(graph.paceLineTargetValue("currency_cents", 5000, 100), 5000);
+
+    graph.destroy();
+  }
+
   function test_empty_graph_can_paint_without_throwing() {
     const graph = createGraph({ graph: { points: [] } });
 

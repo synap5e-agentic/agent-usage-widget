@@ -142,6 +142,18 @@ def _parse_percentage(raw: Any) -> int:
     return max(0, min(100, int(round(value))))
 
 
+def _parse_unbounded_percentage(raw: Any) -> int:
+    if raw is None:
+        return 0
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return 0
+    if 0 < abs(value) < 1.0:
+        value *= 100
+    return max(0, int(round(value)))
+
+
 def _parse_header_json(raw: str, provider: str) -> dict[str, str]:
     if not raw:
         return {}
@@ -301,6 +313,18 @@ def _currency_graph_max(value: Any) -> int:
     else:
         step = 2500
     return int(math.ceil(padded / step) * step)
+
+
+def _percent_graph_max(value: Any, baseline: int = 100) -> int:
+    try:
+        percent = float(value or 0)
+    except (TypeError, ValueError):
+        percent = 0
+    percent = max(float(baseline), percent)
+    if percent <= 100:
+        return 100
+    step = 25 if percent <= 200 else 50
+    return int(math.ceil(percent / step) * step)
 
 
 def _metric_reset_at(raw: dict[str, Any]) -> str:
@@ -1054,7 +1078,8 @@ def normalize_cursor(payload: dict[str, Any], cfg: AppConfig, fetch_url: str, st
         included_cents = int(breakdown.get("included", used) or 0)
         over_cap_cents = int(breakdown.get("bonus", 0) or 0)
         total_spend_cents = int(breakdown.get("total", used) or 0)
-        monthly_percent = _parse_percentage((included_cents / limit) * 100 if limit else 0)
+        monthly_percent = _parse_unbounded_percentage((total_spend_cents / limit) * 100 if limit else 0)
+        stored_monthly_percent = _parse_percentage((total_spend_cents / limit) * 100 if limit else 0)
         auto_message = str(data.get("autoModelSelectedDisplayMessage") or "").strip()
         api_message = str(data.get("namedModelSelectedDisplayMessage") or "").strip()
 
@@ -1065,21 +1090,25 @@ def normalize_cursor(payload: dict[str, Any], cfg: AppConfig, fetch_url: str, st
             "metric_id": "/individualUsage/breakdown/included",
             "metric_scope": "/individualUsage",
             "metric_label": "Monthly usage",
-            "percent": monthly_percent,
-            "value_num": included_cents,
+            "percent": stored_monthly_percent,
+            "value_num": total_spend_cents,
             "value": f"{monthly_percent}%",
             "note": note,
-            "max_value": 100,
+            "max_value": _percent_graph_max(monthly_percent),
             "window_start": window_start,
             "window_end": window_end,
             "reset_at": reset_at,
             "details": {
                 "used_cents": used,
                 "limit_cents": limit,
+                "included_cents": included_cents,
+                "over_cap_cents": over_cap_cents,
+                "total_spend_cents": total_spend_cents,
                 "used_text": _format_money_cents(used),
                 "limit_text": _format_money_cents(limit),
                 "total_percent_used": float(total_percent_used or 0),
                 "summary_message": auto_message,
+                "graph_reference_value": 100,
             },
         })
 
@@ -1498,6 +1527,11 @@ def _graph_from_metric(metric: dict[str, Any], points: list[dict[str, Any]]) -> 
     )
     if value_kind == "currency_cents" and points:
         graph_max_value = max(graph_max_value, _currency_graph_max(points[-1]["value"]))
+    if value_kind == "percent":
+        peak_percent = int(metric.get("percent", 0))
+        if points:
+            peak_percent = max([peak_percent] + [int(point.get("value", 0)) for point in points if isinstance(point, dict)])
+        graph_max_value = _percent_graph_max(max(graph_max_value, peak_percent))
     return {
         "metric_key": metric.get("metric_key"),
         "provider_metric_key": metric.get("provider_metric_key"),
@@ -1510,6 +1544,7 @@ def _graph_from_metric(metric: dict[str, Any], points: list[dict[str, Any]]) -> 
         "reset_at": metric.get("reset_at") or None,
         "value_kind": value_kind,
         "pace_line": bool(details.get("graph_pace_line", value_kind == "percent")),
+        "reference_value": details.get("graph_reference_value"),
         "points": points,
     }
 
@@ -1547,6 +1582,161 @@ def _normalize_graph_points(
         deduped.append(point)
 
     return deduped
+
+
+def _as_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(round(float(value)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _cursor_monthly_limit_cents(metric: dict[str, Any]) -> int:
+    details = _safe_json(metric.get("details"))
+    return _as_int(details.get("limit_cents"))
+
+
+def _cursor_monthly_total_cents(
+    monthly_metric: dict[str, Any],
+    over_cap_metric: dict[str, Any] | None,
+    monthly_percent: int | None = None,
+    over_cap_cents: int | None = None,
+) -> int:
+    details = _safe_json(monthly_metric.get("details"))
+    limit_cents = _cursor_monthly_limit_cents(monthly_metric)
+    if limit_cents <= 0:
+        return _as_int(monthly_metric.get("value_num"))
+
+    total_spend_cents = _as_int(details.get("total_spend_cents"))
+    if monthly_percent is None and over_cap_cents is None and total_spend_cents > 0:
+        return total_spend_cents
+
+    value_num = _as_int(monthly_metric.get("value_num"))
+    if monthly_percent is None and over_cap_cents is None and value_num > limit_cents:
+        return value_num
+
+    pct = _as_int(monthly_percent if monthly_percent is not None else monthly_metric.get("percent"))
+    if pct >= 100:
+        included_cents = limit_cents
+    else:
+        included_cents = min(limit_cents, _as_int((limit_cents * max(0, pct)) / 100))
+
+    if over_cap_cents is None:
+        over_cap_cents = _as_int(over_cap_metric.get("value_num")) if over_cap_metric else 0
+    return max(0, included_cents + max(0, over_cap_cents))
+
+
+def _cursor_adjust_monthly_metric_and_points(
+    monthly_metric: dict[str, Any],
+    over_cap_metric: dict[str, Any] | None,
+    monthly_points: list[dict[str, Any]],
+    over_cap_points: list[dict[str, Any]],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    limit_cents = _cursor_monthly_limit_cents(monthly_metric)
+    if limit_cents <= 0:
+        return monthly_metric, monthly_points
+
+    adjusted_metric = dict(monthly_metric)
+    details = _safe_json(adjusted_metric.get("details"))
+    adjusted_details = dict(details)
+    adjusted_details["graph_reference_value"] = 100
+    adjusted_metric["details"] = adjusted_details
+
+    current_total_cents = _cursor_monthly_total_cents(adjusted_metric, over_cap_metric)
+    current_percent = _parse_unbounded_percentage((current_total_cents / limit_cents) * 100 if limit_cents else 0)
+    adjusted_metric["value_num"] = current_total_cents
+    adjusted_metric["percent"] = current_percent
+    adjusted_metric["value"] = f"{current_percent}%"
+    adjusted_metric["max_value"] = _percent_graph_max(current_percent)
+
+    if any(_as_int(point.get("value")) > 100 for point in monthly_points):
+        return adjusted_metric, monthly_points
+
+    merged: dict[int, dict[str, int]] = {}
+    for point in monthly_points:
+        t = _as_int(point.get("t"))
+        if t <= 0:
+            continue
+        merged.setdefault(t, {})["monthly_percent"] = _as_int(point.get("value"))
+    for point in over_cap_points:
+        t = _as_int(point.get("t"))
+        if t <= 0:
+            continue
+        merged.setdefault(t, {})["over_cap_cents"] = _as_int(point.get("value"))
+
+    if not merged:
+        return adjusted_metric, monthly_points
+
+    combined_points: list[dict[str, int]] = []
+    last_monthly_percent = 0
+    last_over_cap_cents = 0
+    for t in sorted(merged):
+        row = merged[t]
+        if "monthly_percent" in row:
+            last_monthly_percent = row["monthly_percent"]
+        if "over_cap_cents" in row:
+            last_over_cap_cents = row["over_cap_cents"]
+        total_cents = _cursor_monthly_total_cents(
+            adjusted_metric,
+            over_cap_metric,
+            monthly_percent=last_monthly_percent,
+            over_cap_cents=last_over_cap_cents,
+        )
+        total_percent = _parse_unbounded_percentage((total_cents / limit_cents) * 100 if limit_cents else 0)
+        combined_points.append({"t": t, "value": total_percent})
+
+    return adjusted_metric, combined_points
+
+
+def _cursor_monthly_points_from_total_spend(
+    monthly_metric: dict[str, Any],
+    total_spend_points: list[dict[str, Any]],
+) -> list[dict[str, int]]:
+    limit_cents = _cursor_monthly_limit_cents(monthly_metric)
+    if limit_cents <= 0:
+        return []
+
+    points: list[dict[str, int]] = []
+    for point in total_spend_points:
+        t = _as_int(point.get("t"))
+        cents = _as_int(point.get("value"))
+        if t <= 0:
+            continue
+        points.append(
+            {
+                "t": t,
+                "value": _parse_unbounded_percentage((cents / limit_cents) * 100 if limit_cents else 0),
+            }
+        )
+    return points
+
+
+def _cursor_monthly_points_from_non_auto_events(
+    monthly_metric: dict[str, Any],
+    event_points: list[dict[str, Any]],
+) -> list[dict[str, int]]:
+    limit_cents = _cursor_monthly_limit_cents(monthly_metric)
+    current_total_cents = _as_int(monthly_metric.get("value_num"))
+    if limit_cents <= 0 or not event_points:
+        return []
+
+    last_value = _as_int(event_points[-1].get("value"))
+    scale = (float(current_total_cents) / float(last_value)) if current_total_cents > 0 and last_value > 0 else 1.0
+
+    points: list[dict[str, int]] = []
+    for point in event_points:
+        t = _as_int(point.get("t"))
+        cents = _as_int(point.get("value"))
+        if t <= 0:
+            continue
+        scaled_cents = int(round(cents * scale))
+        points.append(
+            {
+                "t": t,
+                "value": _parse_unbounded_percentage((scaled_cents / limit_cents) * 100 if limit_cents else 0),
+            }
+        )
+    return points
 
 
 def _provider_status(
@@ -2281,6 +2471,7 @@ SET
         model: str = "default",
         account_id: str | None = None,
         organization_id: str | None = None,
+        exclude_model: str | None = None,
     ) -> list[dict[str, Any]]:
         if not cycle_end:
             return []
@@ -2292,6 +2483,9 @@ SET
         if organization_id:
             scope_sql += "\n      AND f.organization_id = :'organization_id'"
             vars["organization_id"] = organization_id
+        if exclude_model is not None:
+            scope_sql += "\n      AND COALESCE(e.model, '') <> :'exclude_model'"
+            vars["exclude_model"] = exclude_model
         sql = """
 SELECT COALESCE(json_agg(json_build_object('t', t, 'value', value) ORDER BY t), '[]'::json)
 FROM (
@@ -2303,8 +2497,8 @@ FROM (
     FROM cursor_usage_event e
     JOIN usage_provider_fetch f ON f.id = e.provider_fetch_id
     WHERE e.cycle_end = NULLIF(:'cycle_end', '')::timestamptz
-      AND e.model = :'model'
       AND e.is_chargeable = true
+__MODEL_SQL__
 __SCOPE_SQL__
   )
   SELECT
@@ -2315,7 +2509,8 @@ __SCOPE_SQL__
   ORDER BY bucket ASC
 ) x;
 """
-        return _parse_psql_json(self._run(sql.replace("__SCOPE_SQL__", scope_sql), vars=vars))
+        model_sql = "\n      AND e.model = :'model'" if exclude_model is None else ""
+        return _parse_psql_json(self._run(sql.replace("__SCOPE_SQL__", scope_sql).replace("__MODEL_SQL__", model_sql), vars=vars))
 
     def cursor_auto_spend_points(
         self,
@@ -2535,6 +2730,48 @@ FROM (
                         )
                 except Exception:
                     graph_points[str(metric_path)] = []
+
+            if provider == "cursor":
+                monthly_metric = metric_map.get("monthly")
+                total_spend_metric = metric_map.get("total_spend")
+                over_cap_metric = metric_map.get("over_cap_used")
+                monthly_path = _coalesce(monthly_metric.get("metric_path")) if monthly_metric else ""
+                total_spend_path = _coalesce(total_spend_metric.get("metric_path")) if total_spend_metric else ""
+                over_cap_path = _coalesce(over_cap_metric.get("metric_path")) if over_cap_metric else ""
+                if monthly_metric and monthly_path:
+                    non_auto_event_points = self.cursor_usage_cumulative_points(
+                        cycle_end=_coalesce(monthly_metric.get("window_end") or monthly_metric.get("reset_at")),
+                        account_id=_coalesce(row.get("account_id")),
+                        organization_id=_coalesce(row.get("organization_id")),
+                        exclude_model="default",
+                    )
+                    total_spend_points = (
+                        self.history_points(
+                            provider,
+                            total_spend_path,
+                            history_days,
+                            window_start=_coalesce(total_spend_metric.get("window_start")),
+                            window_end=_coalesce(total_spend_metric.get("window_end") or total_spend_metric.get("reset_at")),
+                            account_id=_coalesce(row.get("account_id")),
+                            organization_id=_coalesce(row.get("organization_id")),
+                            use_value_num=True,
+                        )
+                        if total_spend_metric and total_spend_path
+                        else []
+                    )
+                    adjusted_metric, adjusted_points = _cursor_adjust_monthly_metric_and_points(
+                        monthly_metric,
+                        over_cap_metric,
+                        graph_points.get(monthly_path, []),
+                        graph_points.get(over_cap_path, []),
+                    )
+                    if non_auto_event_points:
+                        adjusted_points = _cursor_monthly_points_from_non_auto_events(adjusted_metric, non_auto_event_points)
+                    elif total_spend_points:
+                        adjusted_points = _cursor_monthly_points_from_total_spend(adjusted_metric, total_spend_points)
+                    metric_map["monthly"] = adjusted_metric
+                    graph_points[monthly_path] = adjusted_points
+
             snapshot = ProviderSnapshot(
                 provider=provider,
                 account_id=_coalesce(row.get("account_id"), ""),
@@ -2549,7 +2786,7 @@ FROM (
                         "metric_label": metric.get("metric_label"),
                         "percent": int(metric.get("percent", 0)),
                         "value_num": metric.get("value_num"),
-                        "value": metric.get("value_text"),
+                        "value": metric.get("value") if metric.get("metric_key") == "monthly" else metric.get("value_text"),
                         "note": metric.get("note", ""),
                         "max_value": int(metric.get("max_value", 100)),
                         "window_start": metric.get("window_start", ""),
@@ -2557,7 +2794,7 @@ FROM (
                         "reset_at": metric.get("reset_at", ""),
                         "details": metric.get("details", {}),
                     }
-                    for metric in metrics
+                    for metric in [metric_map.get(metric.get("metric_key"), metric) for metric in metrics]
                 ],
                 summary_key=summary_key,
                 history_key=history_key,
@@ -2614,6 +2851,64 @@ FROM (
             details = _safe_json(metric.get("details"))
             if provider == "cursor" and metric.get("metric_key") == "auto_spend":
                 points = self.cursor_auto_spend_points(metric, row)
+            elif provider == "cursor" and metric.get("metric_key") == "monthly":
+                non_auto_event_points = self.cursor_usage_cumulative_points(
+                    cycle_end=_coalesce(metric.get("window_end") or metric.get("reset_at")),
+                    account_id=_coalesce(row.get("account_id")),
+                    organization_id=_coalesce(row.get("organization_id")),
+                    exclude_model="default",
+                )
+                total_spend_metric = next((candidate for candidate in metrics if candidate.get("metric_key") == "total_spend"), None)
+                over_cap_metric = next((candidate for candidate in metrics if candidate.get("metric_key") == "over_cap_used"), None)
+                total_spend_path = _coalesce(total_spend_metric.get("metric_path")) if total_spend_metric else ""
+                over_cap_path = _coalesce(over_cap_metric.get("metric_path")) if over_cap_metric else ""
+                total_spend_points = (
+                    self.history_points(
+                        provider,
+                        total_spend_path,
+                        days,
+                        window_start=_coalesce(total_spend_metric.get("window_start")),
+                        window_end=_coalesce(total_spend_metric.get("window_end") or total_spend_metric.get("reset_at")),
+                        account_id=_coalesce(row.get("account_id")),
+                        organization_id=_coalesce(row.get("organization_id")),
+                        use_value_num=True,
+                    )
+                    if total_spend_path
+                    else []
+                )
+                over_cap_points = (
+                    self.history_points(
+                        provider,
+                        over_cap_path,
+                        days,
+                        window_start=_coalesce(over_cap_metric.get("window_start")),
+                        window_end=_coalesce(over_cap_metric.get("window_end") or over_cap_metric.get("reset_at")),
+                        account_id=_coalesce(row.get("account_id")),
+                        organization_id=_coalesce(row.get("organization_id")),
+                        use_value_num=True,
+                    )
+                    if over_cap_path
+                    else []
+                )
+                monthly_points = (
+                    self.history_points(
+                        provider,
+                        metric_path,
+                        days,
+                        window_start=_coalesce(metric.get("window_start")),
+                        window_end=_coalesce(metric.get("window_end") or metric.get("reset_at")),
+                        account_id=_coalesce(row.get("account_id")),
+                        organization_id=_coalesce(row.get("organization_id")),
+                        use_value_num=False,
+                    )
+                    if metric_path
+                    else []
+                )
+                metric, points = _cursor_adjust_monthly_metric_and_points(metric, over_cap_metric, monthly_points, over_cap_points)
+                if non_auto_event_points:
+                    points = _cursor_monthly_points_from_non_auto_events(metric, non_auto_event_points)
+                elif total_spend_points:
+                    points = _cursor_monthly_points_from_total_spend(metric, total_spend_points)
             else:
                 points = (
                     self.history_points(
@@ -2650,6 +2945,74 @@ FROM (
         details = _safe_json(metric_row.get("details"))
         if provider == "cursor" and metric_row.get("metric_key") == "auto_spend":
             points = self.cursor_auto_spend_points(metric_row, row)
+        elif provider == "cursor" and metric_row.get("metric_key") == "monthly":
+            non_auto_event_points = self.cursor_usage_cumulative_points(
+                cycle_end=_coalesce(metric_row.get("window_end") or metric_row.get("reset_at")),
+                account_id=_coalesce(row.get("account_id")),
+                organization_id=_coalesce(row.get("organization_id")),
+                exclude_model="default",
+            )
+            total_spend_metric = self.latest_metric(
+                provider,
+                "total_spend",
+                account_id=_coalesce(row.get("account_id")),
+                organization_id=_coalesce(row.get("organization_id")),
+            ) or {}
+            over_cap_metric = self.latest_metric(
+                provider,
+                "over_cap_used",
+                account_id=_coalesce(row.get("account_id")),
+                organization_id=_coalesce(row.get("organization_id")),
+            ) or {}
+            total_spend_path = _coalesce(total_spend_metric.get("metric_path"))
+            over_cap_path = _coalesce(over_cap_metric.get("metric_path"))
+            total_spend_points = (
+                self.history_points(
+                    provider,
+                    total_spend_path,
+                    days,
+                    window_start=_coalesce(total_spend_metric.get("window_start")),
+                    window_end=_coalesce(total_spend_metric.get("window_end") or total_spend_metric.get("reset_at")),
+                    account_id=_coalesce(row.get("account_id")),
+                    organization_id=_coalesce(row.get("organization_id")),
+                    use_value_num=True,
+                )
+                if total_spend_path
+                else []
+            )
+            over_cap_points = (
+                self.history_points(
+                    provider,
+                    over_cap_path,
+                    days,
+                    window_start=_coalesce(over_cap_metric.get("window_start")),
+                    window_end=_coalesce(over_cap_metric.get("window_end") or over_cap_metric.get("reset_at")),
+                    account_id=_coalesce(row.get("account_id")),
+                    organization_id=_coalesce(row.get("organization_id")),
+                    use_value_num=True,
+                )
+                if over_cap_path
+                else []
+            )
+            monthly_points = (
+                self.history_points(
+                    provider,
+                    metric_path,
+                    days,
+                    window_start=_coalesce(metric_row.get("window_start")),
+                    window_end=_coalesce(metric_row.get("window_end") or metric_row.get("reset_at")),
+                    account_id=_coalesce(row.get("account_id")),
+                    organization_id=_coalesce(row.get("organization_id")),
+                    use_value_num=False,
+                )
+                if metric_path
+                else []
+            )
+            metric_row, points = _cursor_adjust_monthly_metric_and_points(metric_row, over_cap_metric, monthly_points, over_cap_points)
+            if non_auto_event_points:
+                points = _cursor_monthly_points_from_non_auto_events(metric_row, non_auto_event_points)
+            elif total_spend_points:
+                points = _cursor_monthly_points_from_total_spend(metric_row, total_spend_points)
         else:
             points = (
                 self.history_points(

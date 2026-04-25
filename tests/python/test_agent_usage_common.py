@@ -260,6 +260,130 @@ def test_currency_graph_max_uses_latest_history_value() -> None:
     assert graph["max_value"] == common._currency_graph_max(2125)
 
 
+def test_percent_graph_max_expands_above_included_cap_and_keeps_reference_value() -> None:
+    graph = common._graph_from_metric(
+        metric(
+            metric_key="monthly",
+            metric_path="/individualUsage/breakdown/included",
+            percent=138,
+            max_value=100,
+            details={"graph_reference_value": 100},
+        ),
+        [
+            {"t": epoch("2026-04-01T01:00:00+00:00"), "value": 95},
+            {"t": epoch("2026-04-01T02:00:00+00:00"), "value": 121},
+            {"t": epoch("2026-04-01T03:00:00+00:00"), "value": 138},
+        ],
+    )
+
+    assert graph["value_kind"] == "percent"
+    assert graph["reference_value"] == 100
+    assert graph["max_value"] == 150
+
+
+def test_normalize_cursor_monthly_uses_total_spend_percent_and_keeps_over_cap_money() -> None:
+    snapshot = common.normalize_cursor(
+        {
+            "billingCycleStart": "2026-04-01T00:00:00+00:00",
+            "billingCycleEnd": "2026-05-01T00:00:00+00:00",
+            "membershipType": "pro",
+            "individualUsage": {
+                "plan": {
+                    "used": 2000,
+                    "limit": 2000,
+                    "totalPercentUsed": 100,
+                    "breakdown": {
+                        "included": 2000,
+                        "bonus": 760,
+                        "total": 2760,
+                    },
+                },
+            },
+        },
+        common.load_config({"AGENT_USAGE_CURSOR_COOKIE": "WorkosCursorSessionToken=token"}),
+        "https://cursor.com/api/usage-summary",
+        200,
+        None,
+    )
+
+    monthly = next(metric for metric in snapshot.metrics if metric["metric_key"] == "monthly")
+    over_cap = next(metric for metric in snapshot.metrics if metric["metric_key"] == "over_cap_used")
+
+    assert monthly["percent"] == 100
+    assert monthly["value"] == "138%"
+    assert monthly["value_num"] == 2760
+    assert monthly["max_value"] == 150
+    assert monthly["details"]["graph_reference_value"] == 100
+    assert over_cap["value"] == "$7.60"
+
+
+def test_cursor_adjust_monthly_metric_and_points_reconstructs_over_cap_series() -> None:
+    monthly_metric = metric(
+        metric_key="monthly",
+        metric_path="/individualUsage/breakdown/included",
+        percent=100,
+        value_num=2000,
+        value="100%",
+        max_value=100,
+        details={"limit_cents": 2000, "included_cents": 2000},
+    )
+    over_cap_metric = metric(
+        metric_key="over_cap_used",
+        metric_path="/individualUsage/breakdown/bonus",
+        value_num=760,
+        value="$7.60",
+    )
+
+    adjusted_metric, adjusted_points = common._cursor_adjust_monthly_metric_and_points(
+        monthly_metric,
+        over_cap_metric,
+        [
+            {"t": epoch("2026-04-01T01:00:00+00:00"), "value": 95},
+            {"t": epoch("2026-04-01T02:00:00+00:00"), "value": 100},
+        ],
+        [
+            {"t": epoch("2026-04-01T02:00:00+00:00"), "value": 0},
+            {"t": epoch("2026-04-01T03:00:00+00:00"), "value": 760},
+        ],
+    )
+
+    assert adjusted_metric["percent"] == 138
+    assert adjusted_metric["value"] == "138%"
+    assert adjusted_metric["value_num"] == 2760
+    assert adjusted_metric["max_value"] == 150
+    assert adjusted_metric["details"]["graph_reference_value"] == 100
+    assert adjusted_points == [
+        {"t": epoch("2026-04-01T01:00:00+00:00"), "value": 95},
+        {"t": epoch("2026-04-01T02:00:00+00:00"), "value": 100},
+        {"t": epoch("2026-04-01T03:00:00+00:00"), "value": 138},
+    ]
+
+
+def test_cursor_monthly_points_from_total_spend_uses_real_ramp() -> None:
+    monthly_metric = metric(
+        metric_key="monthly",
+        metric_path="/individualUsage/breakdown/included",
+        details={"limit_cents": 2000},
+    )
+
+    points = common._cursor_monthly_points_from_total_spend(
+        monthly_metric,
+        [
+            {"t": epoch("2026-04-01T01:00:00+00:00"), "value": 250},
+            {"t": epoch("2026-04-01T02:00:00+00:00"), "value": 1000},
+            {"t": epoch("2026-04-01T03:00:00+00:00"), "value": 2000},
+            {"t": epoch("2026-04-01T04:00:00+00:00"), "value": 2760},
+        ],
+    )
+
+    assert points == [
+        {"t": epoch("2026-04-01T01:00:00+00:00"), "value": 12},
+        {"t": epoch("2026-04-01T02:00:00+00:00"), "value": 50},
+        {"t": epoch("2026-04-01T03:00:00+00:00"), "value": 100},
+        {"t": epoch("2026-04-01T04:00:00+00:00"), "value": 138},
+    ]
+
+
 class RecordingClient(common.PostgresClient):
     def __init__(self, response: Any = None):
         super().__init__("postgresql://agent_usage:agent_usage@127.0.0.1:5433/agent_usage")
@@ -388,3 +512,164 @@ def test_fingerprint_identity_is_deterministic_and_not_plain_cookie() -> None:
     assert first == second
     assert first.startswith("cursor_user_")
     assert "secret" not in first
+
+
+class CurrentContractClient(common.PostgresClient):
+    def __init__(self):
+        super().__init__("postgresql://agent_usage:agent_usage@127.0.0.1:5433/agent_usage")
+        self.calls: list[tuple[str, str, bool]] = []
+        self.event_calls: list[dict[str, Any]] = []
+
+    def latest_fetch(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "id": 10,
+                "provider": "cursor",
+                "fetched_at": "2026-04-25T04:39:27+00:00",
+                "account_id": "cursor_user_abc",
+                "organization_id": "team_123",
+                "request_metadata": {"summary_key": "monthly", "history_key": "monthly", "plan": "Pro"},
+                "request_error": "",
+            }
+        ]
+
+    def latest_attempts(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "id": 10,
+                "provider": "cursor",
+                "fetched_at": "2026-04-25T04:39:27+00:00",
+                "success": True,
+                "http_status": 200,
+                "account_id": "cursor_user_abc",
+                "organization_id": "team_123",
+                "request_metadata": {},
+                "request_error": "",
+                "raw_payload": {},
+            }
+        ]
+
+    def latest_metrics(self, fetch_id: int) -> list[dict[str, Any]]:
+        assert fetch_id == 10
+        return [
+            {
+                "metric_key": "monthly",
+                "provider_metric_key": "included",
+                "metric_path": "/individualUsage/breakdown/included",
+                "metric_scope": "/individualUsage",
+                "metric_label": "Monthly usage",
+                "percent": 100,
+                "value_num": 2760,
+                "value_text": "138%",
+                "note": "Started at 2026-04-01 00:00 | Resets at 2026-05-01 00:00",
+                "max_value": 150,
+                "window_start": "2026-04-01T00:00:00+00:00",
+                "window_end": "2026-05-01T00:00:00+00:00",
+                "reset_at": "2026-05-01T00:00:00+00:00",
+                "details": {"limit_cents": 2000, "graph_reference_value": 100, "total_spend_cents": 2760},
+            },
+            {
+                "metric_key": "total_spend",
+                "provider_metric_key": "total",
+                "metric_path": "/individualUsage/breakdown/total",
+                "metric_scope": "/individualUsage/breakdown",
+                "metric_label": "Total spend",
+                "percent": 100,
+                "value_num": 2760,
+                "value_text": "$27.60",
+                "note": "Total spend this cycle including any soft overage",
+                "max_value": 2000,
+                "window_start": "2026-04-01T00:00:00+00:00",
+                "window_end": "2026-05-01T00:00:00+00:00",
+                "reset_at": "2026-05-01T00:00:00+00:00",
+                "details": {},
+            },
+            {
+                "metric_key": "over_cap_used",
+                "provider_metric_key": "bonus",
+                "metric_path": "/individualUsage/breakdown/bonus",
+                "metric_scope": "/individualUsage/breakdown",
+                "metric_label": "Over cap used",
+                "percent": 38,
+                "value_num": 760,
+                "value_text": "$7.60",
+                "note": "Soft overage consumed above the included monthly cap",
+                "max_value": 2000,
+                "window_start": "2026-04-01T00:00:00+00:00",
+                "window_end": "2026-05-01T00:00:00+00:00",
+                "reset_at": "2026-05-01T00:00:00+00:00",
+                "details": {},
+            },
+        ]
+
+    def history_points(
+        self,
+        provider: str,
+        metric_path: str,
+        days: int,
+        window_start: str | None = None,
+        window_end: str | None = None,
+        account_id: str | None = None,
+        organization_id: str | None = None,
+        use_value_num: bool = False,
+    ) -> list[dict[str, Any]]:
+        self.calls.append((provider, metric_path, use_value_num))
+        if metric_path == "/individualUsage/breakdown/included":
+            return [
+                {"t": epoch("2026-04-01T01:00:00+00:00"), "value": 100},
+                {"t": epoch("2026-04-01T02:00:00+00:00"), "value": 100},
+            ]
+        if metric_path == "/individualUsage/breakdown/bonus":
+            return [
+                {"t": epoch("2026-04-01T01:00:00+00:00"), "value": 0 if use_value_num else 0},
+                {"t": epoch("2026-04-01T02:00:00+00:00"), "value": 760 if use_value_num else 38},
+            ]
+        if metric_path == "/individualUsage/breakdown/total":
+            return [
+                {"t": epoch("2026-04-01T01:00:00+00:00"), "value": 2000},
+                {"t": epoch("2026-04-01T02:00:00+00:00"), "value": 2760},
+            ]
+        return []
+
+    def cursor_usage_cumulative_points(
+        self,
+        cycle_end: str | None,
+        model: str = "default",
+        account_id: str | None = None,
+        organization_id: str | None = None,
+        exclude_model: str | None = None,
+    ) -> list[dict[str, Any]]:
+        self.event_calls.append(
+            {
+                "cycle_end": cycle_end,
+                "model": model,
+                "account_id": account_id,
+                "organization_id": organization_id,
+                "exclude_model": exclude_model,
+            }
+        )
+        if exclude_model == "default":
+            return [
+                {"t": epoch("2026-04-01T01:00:00+00:00"), "value": 1450},
+                {"t": epoch("2026-04-01T02:00:00+00:00"), "value": 2760},
+            ]
+        return []
+
+
+def test_build_current_contract_uses_service_source_total_spend_for_cursor_monthly_graph() -> None:
+    client = CurrentContractClient()
+
+    payload = client.build_current_contract(history_days=30)
+
+    cursor = next(agent for agent in payload["agents"] if agent["id"] == "cursor")
+    graph = cursor["graphs"]["long_window"]
+
+    assert cursor["summary"]["value"] == "138%"
+    assert cursor["summary"]["percent"] == 138
+    assert graph["reference_value"] == 100
+    assert graph["max_value"] == 150
+    assert graph["points"] == [
+        {"t": epoch("2026-04-01T01:00:00+00:00"), "value": 72},
+        {"t": epoch("2026-04-01T02:00:00+00:00"), "value": 138},
+    ]
+    assert client.event_calls[-1]["exclude_model"] == "default"
