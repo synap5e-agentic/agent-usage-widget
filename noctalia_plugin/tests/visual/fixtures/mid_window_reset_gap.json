@@ -1,0 +1,21 @@
+{
+  "width": 420,
+  "height": 180,
+  "now_ms": 1775023200000,
+  "accent_color": "#e06c75",
+  "graph": {
+    "label": "Mid-window reset gap",
+    "metric_key": "seven_day",
+    "value_kind": "percent",
+    "max_value": 100,
+    "window_start": "2026-04-01T00:00:00Z",
+    "window_end": "2026-04-01T06:00:00Z",
+    "pace_line": true,
+    "points": [
+      { "t": 1775005200, "value": 72 },
+      { "t": 1775008800, "value": 88 },
+      { "t": 1775012400, "value": 3 },
+      { "t": 1775016000, "value": 9 }
+    ]
+  }
+}

@@ -1,0 +1,13 @@
+[Unit]
+Description=Agent usage local service
+After=network.target
+
+[Service]
+Type=simple
+EnvironmentFile=-%h/.config/agent-usage-widget/.env
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/bin/agent-usage-service
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

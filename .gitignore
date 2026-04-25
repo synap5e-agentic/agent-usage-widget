@@ -1,0 +1,9 @@
+.cache/
+.codex
+poller/.env
+__pycache__/
+*.py[cod]
+.pytest_cache/
+noctalia_plugin/tests/visual/actual/
+noctalia_plugin/tests/visual/diffs/
+BACKLOG.md

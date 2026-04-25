@@ -1,0 +1,21 @@
+{
+  "width": 420,
+  "height": 180,
+  "now_ms": 1775030400000,
+  "accent_color": "#f2a65a",
+  "graph": {
+    "label": "Cursor auto spend",
+    "metric_key": "auto_spend",
+    "value_kind": "currency_cents",
+    "max_value": 2500,
+    "window_start": "2026-04-01T00:00:00Z",
+    "window_end": "2026-05-01T00:00:00Z",
+    "pace_line": false,
+    "points": [
+      { "t": 1775005200, "value": 125 },
+      { "t": 1775012400, "value": 525 },
+      { "t": 1775026800, "value": 1210 },
+      { "t": 1775030400, "value": 1380 }
+    ]
+  }
+}

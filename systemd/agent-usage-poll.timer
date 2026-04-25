@@ -1,0 +1,10 @@
+[Unit]
+Description=Refresh agent usage state every 15 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=15min
+RandomizedDelaySec=30
+
+[Install]
+WantedBy=timers.target

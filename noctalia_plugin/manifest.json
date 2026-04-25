@@ -1,0 +1,21 @@
+{
+  "id": "agent-usage",
+  "name": "Agent Usage",
+  "version": "1.0.0",
+  "minNoctaliaVersion": "3.6.0",
+  "author": "Simon",
+  "license": "MIT",
+  "description": "Track Claude and Codex usage windows with budget graphs",
+  "tags": ["Bar", "Panel", "Utility"],
+  "entryPoints": {
+    "main": "Main.qml",
+    "barWidget": "BarWidget.qml",
+    "panel": "Panel.qml"
+  },
+  "dependencies": {
+    "plugins": []
+  },
+  "metadata": {
+    "defaultSettings": {}
+  }
+}

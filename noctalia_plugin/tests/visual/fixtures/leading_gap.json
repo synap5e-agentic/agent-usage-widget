@@ -1,0 +1,20 @@
+{
+  "width": 420,
+  "height": 180,
+  "now_ms": 1775023200000,
+  "accent_color": "#c3d86d",
+  "graph": {
+    "label": "Leading gap",
+    "metric_key": "secondary_window",
+    "value_kind": "percent",
+    "max_value": 100,
+    "window_start": "2026-04-01T00:00:00Z",
+    "window_end": "2026-04-01T06:00:00Z",
+    "pace_line": true,
+    "points": [
+      { "t": 1775019600, "value": 42 },
+      { "t": 1775021400, "value": 51 },
+      { "t": 1775023200, "value": 57 }
+    ]
+  }
+}
