@@ -6,7 +6,7 @@ TestCase {
   name: "PanelBehavior"
 
   function createPanel() {
-    const component = Qt.createComponent(Qt.resolvedUrl("../../Panel.qml"));
+    const component = Qt.createComponent(Qt.resolvedUrl("../../AgentUsagePanel.qml"));
     compare(component.status, Component.Ready, component.errorString());
     const panel = component.createObject(testRoot, { width: 900, height: 500 });
     verify(panel !== null);

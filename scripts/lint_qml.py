@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Syntax-check Noctalia plugin QML files with the local Qt runtime."""
+"""Syntax-check the reusable QML UI and Noctalia wrappers with the local Qt runtime."""
 
 from __future__ import annotations
 
@@ -15,10 +15,12 @@ from typing import cast
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_TARGETS = (
+    Path("qml/UsageGraph.qml"),
+    Path("qml/AgentUsageBar.qml"),
+    Path("qml/AgentUsagePanel.qml"),
     Path("noctalia_plugin/Main.qml"),
     Path("noctalia_plugin/BarWidget.qml"),
     Path("noctalia_plugin/Panel.qml"),
-    Path("noctalia_plugin/UsageGraph.qml"),
 )
 DEFAULT_IMPORT_ROOT_FILE = ROOT / ".cache" / "noctalia-qml-import-root"
 UNAVAILABLE_PATTERNS = (
@@ -176,7 +178,7 @@ def _is_unavailable(output: str) -> bool:
 
 def _parse_args() -> tuple[list[str], bool]:
     parser = argparse.ArgumentParser(description="Syntax-check QML files with qml6")
-    parser.add_argument("targets", nargs="*", help="QML files to lint (defaults to noctalia_plugin/*.qml)")
+    parser.add_argument("targets", nargs="*", help="QML files to lint (defaults to qml/*.qml and noctalia_plugin/*.qml)")
     parser.add_argument(
         "--skip-unavailable",
         action="store_true",

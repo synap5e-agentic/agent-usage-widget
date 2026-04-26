@@ -1,9 +1,8 @@
 import QtQuick
-import QtQuick.Layouts
 import Quickshell
 import qs.Commons
-import qs.Widgets
 import qs.Services.UI
+import "qml" as AgentUsageUi
 
 Item {
   id: root
@@ -26,8 +25,8 @@ Item {
   readonly property var agents: mainInstance ? (mainInstance.agents || []) : []
   readonly property bool hasData: agents.length > 0
 
-  implicitWidth: isVertical ? capsuleHeight : mainLayout.implicitWidth + Style.marginXL
-  implicitHeight: capsuleHeight
+  implicitWidth: widget.implicitWidth
+  implicitHeight: widget.implicitHeight
 
   function statusMessage(agent) {
     const status = (agent && agent.status) || ({});
@@ -36,75 +35,16 @@ Item {
     return String(status.message || status.label || "").trim();
   }
 
-  Rectangle {
-    id: capsule
-    x: Style.pixelAlignCenter(parent.width, width)
-    y: Style.pixelAlignCenter(parent.height, height)
-    width: parent.width
-    height: parent.height
-    color: Style.capsuleColor
-    radius: Style.radiusL
-    border.color: Style.capsuleBorderColor
-    border.width: Style.capsuleBorderWidth
-
-    RowLayout {
-      id: mainLayout
-      anchors.centerIn: parent
-      spacing: Style.marginS
-
-      NIcon {
-        icon: "sparkles"
-        applyUiScale: false
-        pointSize: root.barFontSize
-        color: Color.mPrimary
-      }
-
-      Repeater {
-        model: root.agents
-
-        delegate: RowLayout {
-          required property var modelData
-          spacing: Style.marginXS
-          visible: !root.isVertical
-
-          NText {
-            text: modelData.short_label || modelData.label
-            font.family: Settings.data.ui.fontFixed
-            font.weight: Style.fontWeightBold
-            pointSize: root.barFontSize
-            color: root.mainInstance ? root.mainInstance.accentColor(modelData.accent || "primary") : Color.mPrimary
-          }
-
-          Rectangle {
-            width: Math.max(3, Style.toOdd(root.iconSize * 0.25))
-            height: root.iconSize
-            radius: width / 2
-            color: Color.mOutline
-            Layout.alignment: Qt.AlignVCenter
-
-            Rectangle {
-              property real fillHeight: parent.height * Math.min(1, Math.max(0, (modelData.summary && modelData.summary.percent ? modelData.summary.percent : 0) / 100))
-              width: parent.width
-              height: fillHeight
-              radius: parent.radius
-              color: root.mainInstance ? root.mainInstance.accentColor(modelData.accent || "primary") : Color.mPrimary
-              anchors.bottom: parent.bottom
-
-              Behavior on fillHeight {
-                enabled: !Settings.data.general.animationDisabled
-                NumberAnimation { duration: Style.animationNormal; easing.type: Easing.OutCubic }
-              }
-            }
-          }
-
-          NText {
-            text: modelData.summary ? modelData.summary.value : "--"
-            font.family: Settings.data.ui.fontFixed
-            pointSize: root.barFontSize
-            color: Color.mOnSurface
-          }
-        }
-      }
+  AgentUsageUi.AgentUsageBar {
+    id: widget
+    anchors.fill: parent
+    agents: root.agents
+    isVertical: root.isVertical
+    capsuleHeight: root.capsuleHeight
+    barFontSize: root.barFontSize
+    iconSize: root.iconSize
+    accentColorFn: function(name) {
+      return root.mainInstance ? root.mainInstance.accentColor(name || "primary") : "#ff7a1a";
     }
   }
 
@@ -114,7 +54,7 @@ Item {
     acceptedButtons: Qt.LeftButton
 
     onClicked: {
-      if (pluginApi) pluginApi.togglePanel(screen, root);
+      if (root.pluginApi) root.pluginApi.togglePanel(root.screen, root);
     }
 
     onEntered: {

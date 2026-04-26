@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render Noctalia UsageGraph.qml fixtures and compare them with checked-in baselines."""
+"""Render UsageGraph.qml fixtures and compare them with checked-in baselines."""
 
 from __future__ import annotations
 
@@ -13,10 +13,10 @@ import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-FIXTURE_DIR = ROOT / "noctalia_plugin" / "tests" / "visual" / "fixtures"
-BASELINE_DIR = ROOT / "noctalia_plugin" / "tests" / "visual" / "baselines"
-ACTUAL_DIR = ROOT / "noctalia_plugin" / "tests" / "visual" / "actual"
-DIFF_DIR = ROOT / "noctalia_plugin" / "tests" / "visual" / "diffs"
+FIXTURE_DIR = ROOT / "qml" / "tests" / "visual" / "fixtures"
+BASELINE_DIR = ROOT / "qml" / "tests" / "visual" / "baselines"
+ACTUAL_DIR = ROOT / "qml" / "tests" / "visual" / "actual"
+DIFF_DIR = ROOT / "qml" / "tests" / "visual" / "diffs"
 DEFAULT_IMPORT_ROOT_FILE = ROOT / ".cache" / "noctalia-qml-import-root"
 
 
@@ -70,7 +70,7 @@ TestCase {{
   property var fixture: ({json.dumps(fixture, sort_keys=True)})
 
   function test_render_fixture() {{
-    const component = Qt.createComponent("{_qml_url(ROOT / "noctalia_plugin" / "UsageGraph.qml")}");
+    const component = Qt.createComponent("{_qml_url(ROOT / "qml" / "UsageGraph.qml")}");
     compare(component.status, Component.Ready, component.errorString());
     const graph = component.createObject(testRoot, {{
       width: fixture.width || {width},

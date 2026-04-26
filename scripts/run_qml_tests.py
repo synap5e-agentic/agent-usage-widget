@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run headless Qt Quick Test coverage for the Noctalia plugin QML files."""
+"""Run headless Qt Quick Test coverage for the reusable QML UI files."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_IMPORT_ROOT_FILE = ROOT / ".cache" / "noctalia-qml-import-root"
-DEFAULT_TEST_DIR = ROOT / "noctalia_plugin" / "tests" / "qml"
+DEFAULT_TEST_DIR = ROOT / "qml" / "tests" / "qml"
 
 
 def _first_existing(paths: list[str | None]) -> str | None:

@@ -1,8 +1,8 @@
 # agent-usage-widget
 
-Backend and Noctalia frontend for tracking Claude, Codex, and Cursor usage.
+Backend, reusable QML UI, and Noctalia frontend for tracking Claude, Codex, and Cursor usage.
 
-This repo includes a poller, a local HTTP service, and a bundled QML frontend. The QML frontend is the default consumer, but the service can be used by other frontends as well.
+This repo includes a poller, a local HTTP service, a reusable QML UI layer, and a bundled Noctalia adapter. The service and QML components can be used by other frontends as well.
 
 ![Agent Usage panel](https://github.com/synap5e-agentic/agent-usage-widget/blob/readme-screenshots/docs/screenshots/panel.png?raw=1)
 
@@ -12,19 +12,21 @@ This repo includes a poller, a local HTTP service, and a bundled QML frontend. T
 
 1. `agent-usage-poll` fetches provider usage and writes normalized snapshots to PostgreSQL.
 2. `agent-usage-service` serves `/api/current`, `/api/history`, and `/api/raw/latest`.
-3. `noctalia_plugin/` contains the bundled Noctalia frontend.
-4. `~/.cache/agent-usage/state.json` exists only as a compatibility fallback for the QML side.
+3. `qml/` contains reusable QML components for the bar, panel, and graphs.
+4. `noctalia_plugin/` contains the thin Noctalia / Quickshell adapter layer.
+5. `~/.cache/agent-usage/state.json` exists only as a compatibility fallback for the QML side.
 
 ## Repo Layout
 
 | Path | Purpose |
 |---|---|
 | `poller/` | poller, shared backend code, schema, env template |
-| `noctalia_plugin/` | Noctalia / Quickshell UI |
+| `qml/` | reusable QML components |
+| `noctalia_plugin/` | Noctalia / Quickshell adapter layer |
 | `systemd/` | user service and timer units |
 | `scripts/` | QML setup, lint, test, and visual-regression helpers |
 | `tests/python/` | backend tests |
-| `noctalia_plugin/tests/` | Noctalia QML and visual regression tests |
+| `qml/tests/` | QML and visual regression tests |
 
 ## Requirements
 
@@ -110,4 +112,10 @@ Lint QML:
 
 ```bash
 python3 scripts/lint_qml.py
+```
+
+Render the current UI from the live service payload:
+
+```bash
+python3 scripts/render_widget_screenshots.py
 ```

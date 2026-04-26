@@ -56,9 +56,11 @@ ln -sfv "$SCRIPT_DIR/systemd/agent-usage-service.service" \
   "$HOME/.config/systemd/user/agent-usage-service.service"
 
 mkdir -p "$PLUGIN_DIR"
-for f in manifest.json Main.qml BarWidget.qml Panel.qml UsageGraph.qml; do
+ln -sfn "$SCRIPT_DIR/qml" "$PLUGIN_DIR/qml"
+for f in manifest.json Main.qml BarWidget.qml Panel.qml; do
   ln -sfv "$SCRIPT_DIR/noctalia_plugin/$f" "$PLUGIN_DIR/$f"
 done
+rm -f "$PLUGIN_DIR/UsageGraph.qml"
 
 if [ -f "$PLUGINS_JSON" ]; then
   if python3 -c "

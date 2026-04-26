@@ -5,7 +5,7 @@
   "minNoctaliaVersion": "3.6.0",
   "author": "Simon",
   "license": "MIT",
-  "description": "Track Claude and Codex usage windows with budget graphs",
+  "description": "Track Claude, Codex, and Cursor usage with budget graphs",
   "tags": ["Bar", "Panel", "Utility"],
   "entryPoints": {
     "main": "Main.qml",
