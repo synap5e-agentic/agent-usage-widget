@@ -260,6 +260,18 @@ def test_currency_graph_max_uses_latest_history_value() -> None:
     assert graph["max_value"] == common._currency_graph_max(2125)
 
 
+def test_format_period_note_uses_separate_lines() -> None:
+    note = common._format_period_note(
+        "2026-04-01T00:00:00+00:00",
+        "2026-05-01T00:00:00+00:00",
+    )
+
+    assert "\n" in note
+    first, second = note.split("\n", 1)
+    assert first.startswith("Started at 2026-04-01 ")
+    assert second.startswith("Resets at 2026-05-01 ")
+
+
 def test_percent_graph_max_expands_above_included_cap_and_keeps_reference_value() -> None:
     graph = common._graph_from_metric(
         metric(

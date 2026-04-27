@@ -345,7 +345,7 @@ def _format_period_note(window_start: Any = None, reset_at: Any = None) -> str:
     if reset_text:
         parts.append(f"Resets at {reset_text}")
     if parts:
-        return " | ".join(parts)
+        return "\n".join(parts)
     return "No reset in payload"
 
 
