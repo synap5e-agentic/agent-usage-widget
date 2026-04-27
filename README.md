@@ -119,3 +119,5 @@ Render the current UI from the live service payload:
 ```bash
 python3 scripts/render_widget_screenshots.py
 ```
+
+The renderer writes `/tmp/agent-usage-panel.png` and `/tmp/agent-usage-bar.png` at the README image sizes by default. It renders through the Noctalia plugin wrappers, reads the live `/api/current` payload when available, falls back to `~/.cache/agent-usage/state.json`, and mirrors local Noctalia `settings.json` / `colors.json` for theme and bar sizing.
