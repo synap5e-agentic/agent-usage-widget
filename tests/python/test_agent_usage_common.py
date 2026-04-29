@@ -599,6 +599,23 @@ def test_fingerprint_identity_is_deterministic_and_not_plain_cookie() -> None:
     assert "secret" not in first
 
 
+def test_postgres_dsn_query_host_port_are_used_for_psql_command() -> None:
+    client = common.PostgresClient(
+        "postgresql:///agent_usage"
+        "?host=/run/user/1000/local-postgres"
+        "&port=5433"
+        "&user=agent_usage"
+        "&password=secret"
+    )
+
+    cmd = client._psql_cmd()
+    assert cmd[cmd.index("-h") + 1] == "/run/user/1000/local-postgres"
+    assert cmd[cmd.index("-p") + 1] == "5433"
+    assert cmd[cmd.index("-d") + 1] == "agent_usage"
+    assert cmd[cmd.index("-U") + 1] == "agent_usage"
+    assert client._psql_env()["PGPASSWORD"] == "secret"
+
+
 class CurrentContractClient(common.PostgresClient):
     def __init__(self):
         super().__init__("postgresql://agent_usage:agent_usage@127.0.0.1:5433/agent_usage")

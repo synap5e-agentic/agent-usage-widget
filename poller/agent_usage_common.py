@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 
 DEFAULT_CONFIG_FILE = Path.home() / ".config" / "agent-usage-widget" / "config.toml"
@@ -2323,13 +2323,21 @@ class PostgresClient:
         parsed = urlparse(dsn)
         if not parsed.scheme.startswith("postgres"):
             return None
+        query = parse_qs(parsed.query, keep_blank_values=False)
+
+        def query_value(name: str) -> str | None:
+            values = query.get(name)
+            if not values:
+                return None
+            value = str(values[-1]).strip()
+            return value or None
 
         return self._ParsedDsn(
-            host=parsed.hostname,
-            port=str(parsed.port) if parsed.port else None,
-            user=unquote(parsed.username or "") if parsed.username else None,
-            password=unquote(parsed.password or "") if parsed.password else None,
-            dbname=parsed.path[1:] if parsed.path else None,
+            host=parsed.hostname or query_value("host"),
+            port=str(parsed.port) if parsed.port else query_value("port"),
+            user=unquote(parsed.username or "") if parsed.username else query_value("user"),
+            password=unquote(parsed.password or "") if parsed.password else query_value("password"),
+            dbname=unquote(parsed.path[1:]) if parsed.path and parsed.path != "/" else query_value("dbname"),
         )
 
     def _psql_env(self) -> dict[str, str]:
