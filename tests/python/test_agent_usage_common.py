@@ -177,7 +177,7 @@ host = "127.0.0.1"
 port = 8786
 
 [poller]
-default_interval_seconds = 900
+default_interval_seconds = 60
 
 [sources.personal]
 provider = "claude"
@@ -205,16 +205,30 @@ cookie = "lastActiveOrg=org-work; sessionKey=session"
     )
 
     assert cfg.service_port == 8786
-    assert cfg.poller_default_interval_seconds == 900
+    assert cfg.poller_default_interval_seconds == 60
     assert [source.source_id for source in cfg.sources] == ["personal", "work"]
     assert cfg.sources[0].label == "Claude Personal"
     assert cfg.sources[0].frontend_visible is True
     assert cfg.sources[0].enabled is True
-    assert cfg.sources[0].interval_seconds == 900
+    assert cfg.sources[0].interval_seconds == 60
     assert cfg.sources[1].label == "work"
     assert cfg.sources[1].frontend_visible is False
     assert cfg.sources[1].interval_seconds == 1800
     assert cfg.claude_cookie.startswith("lastActiveOrg=org-personal")
+
+
+def test_postgres_client_parses_query_string_socket_dsn() -> None:
+    client = common.PostgresClient(
+        "postgresql:///agent_usage?host=/run/user/1000/local-postgres&port=5433"
+    )
+
+    assert client._parsed_dsn is not None  # noqa: SLF001
+    assert client._parsed_dsn.host == "/run/user/1000/local-postgres"  # noqa: SLF001
+    assert client._parsed_dsn.port == "5433"  # noqa: SLF001
+    assert client._parsed_dsn.dbname == "agent_usage"  # noqa: SLF001
+    assert "-h" in client._psql_cmd()  # noqa: SLF001
+    assert "/run/user/1000/local-postgres" in client._psql_cmd()  # noqa: SLF001
+    assert "5433" in client._psql_cmd()  # noqa: SLF001
 
 
 def test_normalize_claude_uses_org_from_cookie_or_url() -> None:
@@ -524,6 +538,46 @@ class CursorSpendClient(common.PostgresClient):
         return list(self.points)
 
 
+class CursorSyncRateLimitedClient(common.PostgresClient):
+    def __init__(self):
+        super().__init__("postgresql://agent_usage:agent_usage@127.0.0.1:5433/agent_usage")
+        self.insert_calls = 0
+        self.update_calls = 0
+
+    def latest_cursor_usage_sync_through(self, cycle_end: str, source_id: str = "") -> int:
+        return 0
+
+    def latest_cursor_usage_total_count(self, cycle_end: str, source_id: str = "") -> int:
+        return 0
+
+    def latest_cursor_usage_timestamp(self, cycle_end: str, source_id: str = "") -> int:
+        return 0
+
+    def insert_cursor_usage_events(
+        self,
+        provider_fetch_id: int,
+        source_id: str,
+        cycle_start: str,
+        cycle_end: str,
+        page: int,
+        events: list[dict[str, Any]],
+    ) -> int:
+        self.insert_calls += 1
+        return len(events)
+
+    def update_cursor_usage_sync_state(
+        self,
+        source_id: str,
+        cycle_start: str,
+        cycle_end: str,
+        synced_through_timestamp_ms: int,
+        total_usage_events_count: int,
+        last_page_fetched: int,
+        last_inserted_count: int,
+    ) -> None:
+        self.update_calls += 1
+
+
 def test_cursor_auto_spend_points_append_monotonic_snapshot_and_scope_events() -> None:
     client = CursorSpendClient([{"t": epoch("2026-04-02T01:00:00+00:00"), "value": 300}])
 
@@ -563,6 +617,46 @@ def test_cursor_auto_spend_points_does_not_append_lower_snapshot_after_event_str
     )
 
     assert points == [{"t": epoch("2026-04-02T01:00:00+00:00"), "value": 500}]
+
+
+def test_sync_cursor_usage_events_stops_cleanly_on_rate_limit(monkeypatch: Any) -> None:
+    client = CursorSyncRateLimitedClient()
+    cfg = common.load_config({"AGENT_USAGE_CURSOR_COOKIE": "WorkosCursorSessionToken=token"})
+    snapshot = common.ProviderSnapshot(
+        provider="cursor",
+        account_id="user_123",
+        organization_id="team_456",
+        metrics=[],
+        summary_key="monthly",
+        history_key="monthly",
+        history_label="This Month",
+        details=[],
+        raw_payload={
+            "billingCycleStart": "2026-04-01T00:00:00+00:00",
+            "billingCycleEnd": "2026-05-01T00:00:00+00:00",
+        },
+        request_url="https://cursor.com/api/usage-summary",
+        request_status=200,
+        request_error=None,
+        request_metadata={},
+        success=True,
+        source_id="cursor",
+        source_label="Cursor",
+        frontend_visible=True,
+    )
+
+    monkeypatch.setattr(
+        common,
+        "fetch_cursor_usage_events_page",
+        lambda *args, **kwargs: (429, {}, "rate limited"),
+    )
+
+    stats = common.sync_cursor_usage_events(cfg, client, provider_fetch_id=1, snapshot=snapshot)
+
+    assert stats["pages_fetched"] == 0
+    assert stats["inserted"] == 0
+    assert client.insert_calls == 0
+    assert client.update_calls == 0
 
 
 def test_normalize_cursor_derives_stable_non_legacy_identity_from_payload_or_cookie() -> None:

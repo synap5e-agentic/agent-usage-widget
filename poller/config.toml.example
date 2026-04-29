@@ -3,7 +3,7 @@ host = "127.0.0.1"
 port = 8785
 
 [poller]
-default_interval_seconds = 900
+default_interval_seconds = 60
 
 [sources.personal]
 provider = "claude"
@@ -19,7 +19,6 @@ provider = "claude"
 label = "Claude Work"
 frontend_visible = true
 enabled = false
-interval_seconds = 1800
 
 [sources.work.auth]
 cookie = ""

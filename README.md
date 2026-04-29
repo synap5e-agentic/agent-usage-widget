@@ -59,7 +59,7 @@ host = "127.0.0.1"
 port = 8785
 
 [poller]
-default_interval_seconds = 900
+default_interval_seconds = 60
 
 [sources.personal]
 provider = "claude"
@@ -136,6 +136,14 @@ uv run --with pytest python3 -m pytest tests/python
 python3 scripts/run_qml_tests.py
 python3 scripts/usage_graph_visual_regression.py
 ```
+
+Run the full multi-source stack smoke against a temporary local database:
+
+```bash
+python3 scripts/run_multi_source_stack_smoke.py
+```
+
+This writes a temporary multi-source `config.toml`, seeds a throwaway Postgres database, starts the real local service, validates `/api/current`, `/api/history`, and `/api/raw/latest`, and renders panel/bar PNGs into `/tmp/agent-usage-multi-source-smoke/`.
 
 Lint QML:
 

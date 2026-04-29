@@ -126,6 +126,10 @@ def _write_compat_state(cfg: AppConfig, client: PostgresClient, history_days: in
     print(f"[agent-usage-poll] wrote state file: {path}")
 
 
+def _is_rate_limited(snapshot: ProviderSnapshot) -> bool:
+    return int(snapshot.request_status or 0) == 429
+
+
 def main() -> int:
     args = parse_args()
     cfg = _load_config(args)
@@ -164,6 +168,12 @@ def main() -> int:
                     f" total={sync_stats['total_events']}"
                 )
             snapshots.append(snapshot)
+            if _is_rate_limited(snapshot):
+                print(
+                    f"[agent-usage-poll] {source.source_id} ({source.provider}): "
+                    "rate limited (429); recorded the failed attempt and will try again next cycle"
+                )
+                continue
             print(
                 f"[agent-usage-poll] {source.source_id} ({source.provider}): "
                 f"status={snapshot.request_status}, success={snapshot.success}, metrics={len(snapshot.metrics)}"

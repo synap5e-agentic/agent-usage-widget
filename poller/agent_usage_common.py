@@ -28,7 +28,7 @@ DEFAULT_STATE_FILE = DEFAULT_CACHE_DIR / "state.json"
 DEFAULT_DB_DSN = "postgresql://agent_usage:agent_usage@127.0.0.1:5433/agent_usage"
 DEFAULT_SERVICE_HOST = "127.0.0.1"
 DEFAULT_SERVICE_PORT = 8785
-DEFAULT_POLL_INTERVAL_SECONDS = 900
+DEFAULT_POLL_INTERVAL_SECONDS = 60
 SUPPORTED_PROVIDERS = ("claude", "codex", "cursor")
 
 
@@ -1800,6 +1800,12 @@ def sync_cursor_usage_events(
             page_size=page_size,
             source=next((candidate for candidate in cfg.sources if candidate.source_id == source_id), None),
         )
+        if status == 429:
+            print(
+                f"[agent-usage-poll] {source_id} cursor usage-events: "
+                "rate limited (429); stopping sync for this cycle"
+            )
+            break
         if status != 200 or error:
             break
 
