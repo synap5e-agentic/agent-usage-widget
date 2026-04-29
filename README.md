@@ -20,7 +20,7 @@ This repo includes a poller, a local HTTP service, a reusable QML UI layer, and 
 
 | Path | Purpose |
 |---|---|
-| `poller/` | poller, shared backend code, schema, env template |
+| `poller/` | poller, shared backend code, schema, config templates |
 | `qml/` | reusable QML components |
 | `noctalia_plugin/` | Noctalia / Quickshell adapter layer |
 | `systemd/` | user service and timer units |
@@ -47,25 +47,52 @@ This repo includes a poller, a local HTTP service, a reusable QML UI layer, and 
 
 ```bash
 mkdir -p ~/.config/agent-usage-widget
-cp poller/.env.example ~/.config/agent-usage-widget/.env
-chmod 600 ~/.config/agent-usage-widget/.env
+cp poller/config.toml.example ~/.config/agent-usage-widget/config.toml
+chmod 600 ~/.config/agent-usage-widget/config.toml
 ```
 
-3. Fill in only the providers you want:
+3. Configure each provider identity as a source:
 
-```dotenv
-AGENT_USAGE_ENABLE_CLAUDE=1
-AGENT_USAGE_CLAUDE_COOKIE=...
+```toml
+[service]
+host = "127.0.0.1"
+port = 8785
 
-AGENT_USAGE_ENABLE_CODEX=1
-AGENT_USAGE_CODEX_AUTHORIZATION=...
-AGENT_USAGE_CODEX_COOKIE=...
+[poller]
+default_interval_seconds = 900
 
-AGENT_USAGE_ENABLE_CURSOR=1
-AGENT_USAGE_CURSOR_COOKIE=...
+[sources.personal]
+provider = "claude"
+label = "Claude Personal"
+frontend_visible = true
+
+[sources.personal.auth]
+cookie = "..."
+
+[sources.work]
+provider = "claude"
+label = "Claude Work"
+frontend_visible = true
+interval_seconds = 1800
+
+[sources.work.auth]
+cookie = "..."
+
+[sources.codex]
+provider = "codex"
+label = "Codex"
+frontend_visible = true
+
+[sources.codex.auth]
+authorization = "Bearer ..."
+cookie = "..."
 ```
 
-`poller/.env.example` is the template. Do not commit a filled live `.env`.
+`~/.config/agent-usage-widget/config.toml` is the primary runtime config. Source table names such as `personal` and `work` become stable `source_id` values in the service contract. `label` defaults to the source id, `frontend_visible` and `enabled` default to `true`, and `interval_seconds` defaults to `poller.default_interval_seconds`.
+
+The checked-in `poller/config.toml.example` disables placeholder sources so a fresh install does not poll empty credentials. Set `enabled = true` or remove that line after filling in auth.
+
+Legacy `.env` configuration is still read as a fallback when no TOML sources are configured. If both files exist, `config.toml` controls service settings and sources; explicit CLI overrides still win.
 
 Known limitation: provider auth here is based on copied browser cookies and session tokens. They expire and have to be refreshed manually. The service can surface stale or expired sign-in state, but it cannot renew credentials for you yet. This is a major UX limitation of the current design.
 
@@ -89,8 +116,10 @@ Default base URL: `http://127.0.0.1:8785`
 
 - `/health` - service health
 - `/api/current` - current widget contract
-- `/api/history` - graph history for a provider or metric
-- `/api/raw/latest` - latest stored raw provider payload
+- `/api/history?source=<source_id>&metric=<metric>` - graph history for a configured source
+- `/api/history?provider=<provider>&metric=<metric>` - legacy provider-scoped history
+- `/api/raw/latest?source=<source_id>` - latest stored raw source payload
+- `/api/raw/latest?provider=<provider>` - legacy latest stored raw provider payload
 
 ## Development
 

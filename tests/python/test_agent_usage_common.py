@@ -168,6 +168,55 @@ def test_claude_auth_headers_support_cookie_only_mode() -> None:
     assert headers["anthropic-device-id"] == "device-123"
 
 
+def test_load_config_reads_toml_sources_and_defaults(tmp_path: Path) -> None:
+    config_file = tmp_path / "config.toml"
+    config_file.write_text(
+        """
+[service]
+host = "127.0.0.1"
+port = 8786
+
+[poller]
+default_interval_seconds = 900
+
+[sources.personal]
+provider = "claude"
+label = "Claude Personal"
+
+[sources.personal.auth]
+cookie = "lastActiveOrg=org-personal; sessionKey=session"
+
+[sources.work]
+provider = "claude"
+frontend_visible = false
+interval_seconds = 1800
+
+[sources.work.auth]
+cookie = "lastActiveOrg=org-work; sessionKey=session"
+""".strip(),
+        encoding="utf-8",
+    )
+
+    cfg = common.load_config(
+        {
+            "AGENT_USAGE_CONFIG_FILE": str(config_file),
+            "AGENT_USAGE_ENV_FILE": str(tmp_path / "missing.env"),
+        }
+    )
+
+    assert cfg.service_port == 8786
+    assert cfg.poller_default_interval_seconds == 900
+    assert [source.source_id for source in cfg.sources] == ["personal", "work"]
+    assert cfg.sources[0].label == "Claude Personal"
+    assert cfg.sources[0].frontend_visible is True
+    assert cfg.sources[0].enabled is True
+    assert cfg.sources[0].interval_seconds == 900
+    assert cfg.sources[1].label == "work"
+    assert cfg.sources[1].frontend_visible is False
+    assert cfg.sources[1].interval_seconds == 1800
+    assert cfg.claude_cookie.startswith("lastActiveOrg=org-personal")
+
+
 def test_normalize_claude_uses_org_from_cookie_or_url() -> None:
     cfg = common.load_config(
         {
@@ -427,8 +476,26 @@ def test_history_points_scopes_identity_and_can_use_value_num() -> None:
     assert "AND f.account_id = :'account_id'" in sql
     assert "AND f.organization_id = :'organization_id'" in sql
     assert vars is not None
+    assert "source_id" not in vars
     assert vars["account_id"] == "cursor_user_abc"
     assert vars["organization_id"] == "team_123"
+
+
+def test_history_points_can_scope_by_source_id() -> None:
+    client = RecordingClient(response=[{"t": 1775001600, "value": 42}])
+
+    points = client.history_points(
+        "claude",
+        "/seven_day",
+        30,
+        source_id="personal",
+    )
+
+    sql, vars = client.calls[-1]
+    assert points == [{"t": 1775001600, "value": 42}]
+    assert "AND f.source_id = :'source_id'" in sql
+    assert vars is not None
+    assert vars["source_id"] == "personal"
 
 
 class CursorSpendClient(common.PostgresClient):
@@ -441,14 +508,18 @@ class CursorSpendClient(common.PostgresClient):
         self,
         cycle_end: str | None,
         model: str = "default",
+        source_id: str | None = None,
         account_id: str | None = None,
         organization_id: str | None = None,
+        exclude_model: str | None = None,
     ) -> list[dict[str, Any]]:
         self.scope = {
             "cycle_end": cycle_end,
             "model": model,
+            "source_id": source_id,
             "account_id": account_id,
             "organization_id": organization_id,
+            "exclude_model": exclude_model,
         }
         return list(self.points)
 
@@ -472,8 +543,10 @@ def test_cursor_auto_spend_points_append_monotonic_snapshot_and_scope_events() -
     assert client.scope == {
         "cycle_end": "2026-05-01T00:00:00+00:00",
         "model": "default",
+        "source_id": "",
         "account_id": "cursor_user_abc",
         "organization_id": "team_123",
+        "exclude_model": None,
     }
     assert points == [
         {"t": epoch("2026-04-02T01:00:00+00:00"), "value": 300},
@@ -532,10 +605,15 @@ class CurrentContractClient(common.PostgresClient):
         self.calls: list[tuple[str, str, bool]] = []
         self.event_calls: list[dict[str, Any]] = []
 
-    def latest_fetch(self) -> list[dict[str, Any]]:
+    def latest_fetch(
+        self,
+        source_ids: list[str] | tuple[str, ...] | None = None,
+        providers: list[str] | tuple[str, ...] | None = None,
+    ) -> list[dict[str, Any]]:
         return [
             {
                 "id": 10,
+                "source_id": "cursor",
                 "provider": "cursor",
                 "fetched_at": "2026-04-25T04:39:27+00:00",
                 "account_id": "cursor_user_abc",
@@ -545,10 +623,15 @@ class CurrentContractClient(common.PostgresClient):
             }
         ]
 
-    def latest_attempts(self) -> list[dict[str, Any]]:
+    def latest_attempts(
+        self,
+        source_ids: list[str] | tuple[str, ...] | None = None,
+        providers: list[str] | tuple[str, ...] | None = None,
+    ) -> list[dict[str, Any]]:
         return [
             {
                 "id": 10,
+                "source_id": "cursor",
                 "provider": "cursor",
                 "fetched_at": "2026-04-25T04:39:27+00:00",
                 "success": True,
@@ -621,6 +704,7 @@ class CurrentContractClient(common.PostgresClient):
         days: int,
         window_start: str | None = None,
         window_end: str | None = None,
+        source_id: str | None = None,
         account_id: str | None = None,
         organization_id: str | None = None,
         use_value_num: bool = False,
@@ -647,6 +731,7 @@ class CurrentContractClient(common.PostgresClient):
         self,
         cycle_end: str | None,
         model: str = "default",
+        source_id: str | None = None,
         account_id: str | None = None,
         organization_id: str | None = None,
         exclude_model: str | None = None,
@@ -655,6 +740,7 @@ class CurrentContractClient(common.PostgresClient):
             {
                 "cycle_end": cycle_end,
                 "model": model,
+                "source_id": source_id,
                 "account_id": account_id,
                 "organization_id": organization_id,
                 "exclude_model": exclude_model,
@@ -685,3 +771,133 @@ def test_build_current_contract_uses_service_source_total_spend_for_cursor_month
         {"t": epoch("2026-04-01T02:00:00+00:00"), "value": 138},
     ]
     assert client.event_calls[-1]["exclude_model"] == "default"
+    assert client.event_calls[-1]["source_id"] == "cursor"
+
+
+class MultiClaudeClient(common.PostgresClient):
+    def __init__(self):
+        super().__init__("postgresql://agent_usage:agent_usage@127.0.0.1:5433/agent_usage")
+        self.history_source_ids: list[str | None] = []
+
+    def latest_fetch(
+        self,
+        source_ids: list[str] | tuple[str, ...] | None = None,
+        providers: list[str] | tuple[str, ...] | None = None,
+    ) -> list[dict[str, Any]]:
+        rows = [
+            {
+                "id": 1,
+                "source_id": "personal",
+                "provider": "claude",
+                "fetched_at": "2026-04-25T01:00:00+00:00",
+                "account_id": "org-personal",
+                "organization_id": "org-personal",
+                "request_metadata": {
+                    "source_id": "personal",
+                    "source_label": "Claude Personal",
+                    "summary_key": "seven_day",
+                    "history_key": "seven_day",
+                },
+                "request_error": "",
+            },
+            {
+                "id": 2,
+                "source_id": "work",
+                "provider": "claude",
+                "fetched_at": "2026-04-25T02:00:00+00:00",
+                "account_id": "org-work",
+                "organization_id": "org-work",
+                "request_metadata": {
+                    "source_id": "work",
+                    "source_label": "Claude Work",
+                    "summary_key": "seven_day",
+                    "history_key": "seven_day",
+                },
+                "request_error": "",
+            },
+        ]
+        if source_ids:
+            rows = [row for row in rows if row["source_id"] in source_ids]
+        if providers:
+            rows = [row for row in rows if row["provider"] in providers]
+        return rows
+
+    def latest_attempts(
+        self,
+        source_ids: list[str] | tuple[str, ...] | None = None,
+        providers: list[str] | tuple[str, ...] | None = None,
+    ) -> list[dict[str, Any]]:
+        return [
+            {
+                **row,
+                "success": True,
+                "http_status": 200,
+                "raw_payload": {},
+            }
+            for row in self.latest_fetch(source_ids=source_ids, providers=providers)
+        ]
+
+    def latest_metrics(self, fetch_id: int) -> list[dict[str, Any]]:
+        percent = 21 if fetch_id == 1 else 64
+        return [
+            {
+                "source_id": "personal" if fetch_id == 1 else "work",
+                "metric_key": "seven_day",
+                "provider_metric_key": "seven_day",
+                "metric_path": "/seven_day",
+                "metric_scope": "/",
+                "metric_label": "This week",
+                "percent": percent,
+                "value_num": percent,
+                "value_text": f"{percent}%",
+                "note": "",
+                "max_value": 100,
+                "window_start": "",
+                "window_end": "",
+                "reset_at": "",
+                "details": {},
+            }
+        ]
+
+    def history_points(
+        self,
+        provider: str,
+        metric_path: str,
+        days: int,
+        window_start: str | None = None,
+        window_end: str | None = None,
+        source_id: str | None = None,
+        account_id: str | None = None,
+        organization_id: str | None = None,
+        use_value_num: bool = False,
+    ) -> list[dict[str, Any]]:
+        self.history_source_ids.append(source_id)
+        return []
+
+
+def test_build_current_contract_renders_multiple_sources_for_same_provider() -> None:
+    client = MultiClaudeClient()
+    sources = (
+        common.SourceConfig("personal", "claude", "Claude Personal"),
+        common.SourceConfig("work", "claude", "Claude Work"),
+    )
+
+    payload = client.build_current_contract(history_days=30, sources=sources)
+
+    assert [agent["id"] for agent in payload["agents"]] == ["personal", "work"]
+    assert [agent["provider"] for agent in payload["agents"]] == ["claude", "claude"]
+    assert [agent["label"] for agent in payload["agents"]] == ["Claude Personal", "Claude Work"]
+    assert [agent["summary"]["percent"] for agent in payload["agents"]] == [21, 64]
+    assert client.history_source_ids == ["personal", "work"]
+
+
+def test_build_current_contract_filters_frontend_invisible_sources() -> None:
+    client = MultiClaudeClient()
+    sources = (
+        common.SourceConfig("personal", "claude", "Claude Personal"),
+        common.SourceConfig("work", "claude", "Claude Work", frontend_visible=False),
+    )
+
+    payload = client.build_current_contract(history_days=30, sources=sources)
+
+    assert [agent["id"] for agent in payload["agents"]] == ["personal"]

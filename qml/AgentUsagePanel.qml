@@ -48,8 +48,8 @@ Item {
 
   function providerRank(agent) {
     const order = { "claude": 0, "codex": 1, "cursor": 2 };
-    const id = (agent && agent.id) || "";
-    return order.hasOwnProperty(id) ? order[id] : 99;
+    const provider = (agent && (agent.provider || agent.id)) || "";
+    return order.hasOwnProperty(provider) ? order[provider] : 99;
   }
 
   function orderAgents(list) {
@@ -63,7 +63,7 @@ Item {
   }
 
   function shouldShowMetric(agent, metric) {
-    const provider = (agent && agent.id) || "";
+    const provider = (agent && (agent.provider || agent.id)) || "";
     const key = ((metric && metric.metric_key) || "").toLowerCase();
     const providerKey = ((metric && metric.provider_metric_key) || "").toLowerCase();
     const path = ((metric && metric.metric_path) || "").toLowerCase();

@@ -17,13 +17,13 @@ TestCase {
     const panel = createPanel();
 
     const ordered = panel.orderAgents([
-      { id: "cursor", label: "Cursor" },
+      { id: "work", provider: "cursor", label: "Cursor" },
       { id: "other", label: "Other" },
-      { id: "claude", label: "Claude" },
-      { id: "codex", label: "Codex" },
+      { id: "personal", provider: "claude", label: "Claude" },
+      { id: "codex", provider: "codex", label: "Codex" },
     ]);
 
-    compare(ordered.map(function(agent) { return agent.id; }).join(","), "claude,codex,cursor,other");
+    compare(ordered.map(function(agent) { return agent.id; }).join(","), "personal,codex,work,other");
     panel.destroy();
   }
 
@@ -50,6 +50,7 @@ TestCase {
     const panel = createPanel();
     const cursor = {
       id: "cursor",
+      provider: "cursor",
       graphs: {
         long_window: { metric_path: "/monthly" },
         short_window: { metric_path: "/auto" },

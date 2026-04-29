@@ -11,6 +11,7 @@ import os
 import re
 import ssl
 import subprocess
+import tomllib
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -20,16 +21,31 @@ from urllib.request import Request, urlopen
 from urllib.parse import unquote, urlparse
 
 
+DEFAULT_CONFIG_FILE = Path.home() / ".config" / "agent-usage-widget" / "config.toml"
 DEFAULT_ENV_FILE = Path.home() / ".config" / "agent-usage-widget" / ".env"
 DEFAULT_CACHE_DIR = Path.home() / ".cache" / "agent-usage"
 DEFAULT_STATE_FILE = DEFAULT_CACHE_DIR / "state.json"
 DEFAULT_DB_DSN = "postgresql://agent_usage:agent_usage@127.0.0.1:5433/agent_usage"
 DEFAULT_SERVICE_HOST = "127.0.0.1"
 DEFAULT_SERVICE_PORT = 8785
+DEFAULT_POLL_INTERVAL_SECONDS = 900
+SUPPORTED_PROVIDERS = ("claude", "codex", "cursor")
+
+
+@dataclass(frozen=True)
+class SourceConfig:
+    source_id: str
+    provider: str
+    label: str
+    frontend_visible: bool = True
+    enabled: bool = True
+    interval_seconds: int = DEFAULT_POLL_INTERVAL_SECONDS
+    auth: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
 class AppConfig:
+    config_file: Path
     env_file: Path
     cache_dir: Path
     state_path: Path
@@ -54,6 +70,8 @@ class AppConfig:
     cursor_cookie: str
     cursor_headers_json: str
     codex_oai_session_id: str | None = None
+    poller_default_interval_seconds: int = DEFAULT_POLL_INTERVAL_SECONDS
+    sources: tuple[SourceConfig, ...] = ()
 
 
 @dataclass
@@ -72,6 +90,9 @@ class ProviderSnapshot:
     request_error: str | None
     request_metadata: dict[str, Any] = field(default_factory=dict)
     success: bool = False
+    source_id: str = ""
+    source_label: str = ""
+    frontend_visible: bool = True
 
 
 SCHEMA_SQL_PATH = Path(__file__).resolve().parent / "schema.sql"
@@ -101,10 +122,41 @@ def read_env_file(path: Path) -> dict[str, str]:
     return values
 
 
+def read_toml_file(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        with path.open("rb") as fh:
+            parsed = tomllib.load(fh)
+    except tomllib.TOMLDecodeError as exc:
+        raise ValueError(f"Invalid config TOML at {path}: {exc}") from exc
+    if not isinstance(parsed, dict):
+        return {}
+    return parsed
+
+
 def _bool_value(value: str | None, default: bool = False) -> bool:
     if value is None:
         return default
     return str(value).strip().lower() not in {"0", "false", "off", "no"}
+
+
+def _toml_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return _bool_value(str(value), default)
+
+
+def _int_value(value: Any, default: int) -> int:
+    if value is None:
+        return default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
 
 
 def _coalesce(*values: str | None) -> str:
@@ -123,6 +175,42 @@ def _fingerprint_identity(prefix: str, raw: str | None) -> str:
         return ""
     digest = hashlib.sha1(value.encode("utf-8")).hexdigest()[:16]
     return f"{prefix}_{digest}"
+
+
+def _source_key(value: Any) -> str:
+    source_id = str(value or "").strip()
+    if not source_id:
+        raise ValueError("source key must not be empty")
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", source_id):
+        raise ValueError(f"Invalid source key {source_id!r}; use letters, numbers, dot, dash, or underscore")
+    return source_id
+
+
+def _string_map(raw: Any) -> dict[str, str]:
+    if not isinstance(raw, dict):
+        return {}
+    values: dict[str, str] = {}
+    for key, value in raw.items():
+        if value is None:
+            continue
+        values[str(key)] = str(value)
+    return values
+
+
+def _toml_table(raw: Any) -> dict[str, Any]:
+    return raw if isinstance(raw, dict) else {}
+
+
+def _source_auth_value(source: SourceConfig | None, *keys: str) -> str:
+    if not source:
+        return ""
+    for key in keys:
+        value = source.auth.get(key)
+        if value is not None:
+            value = str(value).strip()
+            if value:
+                return value
+    return ""
 
 def _to_base64_json(value: Any) -> str:
     return base64.b64encode(
@@ -220,10 +308,18 @@ def _parse_cookie_header(raw: str | None) -> dict[str, str]:
     return parsed
 
 
-def _claude_organization_id(cfg: AppConfig, fetch_url: str | None = None) -> str:
-    if cfg.claude_organization_id:
-        return cfg.claude_organization_id
-    cookie_values = _parse_cookie_header(cfg.claude_cookie)
+def _claude_organization_id(
+    cfg: AppConfig,
+    fetch_url: str | None = None,
+    source: SourceConfig | None = None,
+) -> str:
+    configured_org = _coalesce(
+        _source_auth_value(source, "organization_id", "org_id"),
+        cfg.claude_organization_id,
+    )
+    if configured_org:
+        return configured_org
+    cookie_values = _parse_cookie_header(_coalesce(_source_auth_value(source, "cookie"), cfg.claude_cookie))
     if cookie_values.get("lastActiveOrg"):
         return cookie_values["lastActiveOrg"]
     if fetch_url:
@@ -666,7 +762,105 @@ def _pick_metric_by_candidates(
     return None
 
 
+def _legacy_sources_from_values(values: dict[str, str], default_interval_seconds: int) -> tuple[SourceConfig, ...]:
+    sources: list[SourceConfig] = []
+    if _bool_value(values.get("AGENT_USAGE_ENABLE_CLAUDE", "0"), False):
+        sources.append(
+            SourceConfig(
+                source_id="claude",
+                provider="claude",
+                label="Claude",
+                interval_seconds=default_interval_seconds,
+                auth={
+                    "cookie": _coalesce(values.get("AGENT_USAGE_CLAUDE_COOKIE")),
+                    "organization_id": _coalesce(values.get("AGENT_USAGE_CLAUDE_ORGANIZATION_ID")),
+                    "anonymous_id": _coalesce(values.get("AGENT_USAGE_CLAUDE_ANONYMOUS_ID")),
+                    "device_id": _coalesce(values.get("AGENT_USAGE_CLAUDE_DEVICE_ID")),
+                    "session_key": _coalesce(values.get("AGENT_USAGE_CLAUDE_SESSION_KEY")),
+                    "headers_json": _coalesce(values.get("AGENT_USAGE_CLAUDE_HEADERS_JSON")),
+                },
+            )
+        )
+    if _bool_value(values.get("AGENT_USAGE_ENABLE_CODEX", "0"), False):
+        sources.append(
+            SourceConfig(
+                source_id="codex",
+                provider="codex",
+                label="Codex",
+                interval_seconds=default_interval_seconds,
+                auth={
+                    "account_id": _coalesce(values.get("AGENT_USAGE_CODEX_ACCOUNT_ID")),
+                    "authorization": _coalesce(values.get("AGENT_USAGE_CODEX_AUTHORIZATION")),
+                    "device_id": _coalesce(values.get("AGENT_USAGE_CODEX_DEVICE_ID")),
+                    "session_id": _coalesce(values.get("AGENT_USAGE_CODEX_SESSION_ID")),
+                    "oai_session_id": _coalesce(values.get("AGENT_USAGE_CODEX_OAI_SESSION_ID")),
+                    "cookie": _coalesce(values.get("AGENT_USAGE_CODEX_COOKIE")),
+                    "headers_json": _coalesce(values.get("AGENT_USAGE_CODEX_HEADERS_JSON")),
+                },
+            )
+        )
+    if _bool_value(values.get("AGENT_USAGE_ENABLE_CURSOR", "0"), False):
+        sources.append(
+            SourceConfig(
+                source_id="cursor",
+                provider="cursor",
+                label="Cursor",
+                interval_seconds=default_interval_seconds,
+                auth={
+                    "cookie": _coalesce(values.get("AGENT_USAGE_CURSOR_COOKIE")),
+                    "headers_json": _coalesce(values.get("AGENT_USAGE_CURSOR_HEADERS_JSON")),
+                },
+            )
+        )
+    return tuple(sources)
+
+
+def _sources_from_toml(config: dict[str, Any], default_interval_seconds: int) -> tuple[SourceConfig, ...]:
+    sources_table = _toml_table(config.get("sources"))
+    sources: list[SourceConfig] = []
+    seen: set[str] = set()
+    for raw_key, raw_source in sources_table.items():
+        source_id = _source_key(raw_key)
+        if source_id in seen:
+            raise ValueError(f"Duplicate source key {source_id!r}")
+        seen.add(source_id)
+        source = _toml_table(raw_source)
+        provider = str(source.get("provider") or "").strip().lower()
+        if provider not in SUPPORTED_PROVIDERS:
+            raise ValueError(
+                f"Source {source_id!r} has invalid provider {provider!r}; "
+                f"expected one of: {', '.join(SUPPORTED_PROVIDERS)}"
+            )
+        interval_seconds = _int_value(source.get("interval_seconds"), default_interval_seconds)
+        sources.append(
+            SourceConfig(
+                source_id=source_id,
+                provider=provider,
+                label=_coalesce(source.get("label"), source_id),
+                frontend_visible=_toml_bool(source.get("frontend_visible"), True),
+                enabled=_toml_bool(source.get("enabled"), True),
+                interval_seconds=interval_seconds,
+                auth=_string_map(source.get("auth")),
+            )
+        )
+    return tuple(sources)
+
+
+def _first_source_for_provider(sources: tuple[SourceConfig, ...], provider: str) -> SourceConfig | None:
+    for source in sources:
+        if source.provider == provider:
+            return source
+    return None
+
+
 def load_config(overrides: dict[str, str] | None = None) -> AppConfig:
+    config_file = Path(
+        _coalesce(
+            overrides.get("AGENT_USAGE_CONFIG_FILE") if overrides else None,
+            os.environ.get("AGENT_USAGE_CONFIG_FILE"),
+            str(DEFAULT_CONFIG_FILE),
+        )
+    ).expanduser()
     env_file = Path(
         _coalesce(
             overrides.get("AGENT_USAGE_ENV_FILE") if overrides else None,
@@ -677,63 +871,197 @@ def load_config(overrides: dict[str, str] | None = None) -> AppConfig:
     values = {**read_env_file(env_file), **os.environ}
     if overrides:
         values.update(overrides)
+    explicit_values = overrides or {}
+    toml_config = read_toml_file(config_file)
+    service_config = _toml_table(toml_config.get("service"))
+    poller_config = _toml_table(toml_config.get("poller"))
+    storage_config = _toml_table(toml_config.get("storage"))
 
-    cache_dir = Path(_coalesce(values.get("AGENT_USAGE_CACHE_DIR"), str(DEFAULT_CACHE_DIR))).expanduser()
-    state_path = Path(_coalesce(values.get("AGENT_USAGE_STATE_FILE"), str(cache_dir / "state.json"))).expanduser()
+    default_interval_seconds = _int_value(
+        explicit_values.get("AGENT_USAGE_POLL_INTERVAL_SECONDS"),
+        _int_value(
+            poller_config.get("default_interval_seconds"),
+            _int_value(values.get("AGENT_USAGE_POLL_INTERVAL_SECONDS"), DEFAULT_POLL_INTERVAL_SECONDS),
+        ),
+    )
+    toml_sources = _sources_from_toml(toml_config, default_interval_seconds)
+    sources = toml_sources or _legacy_sources_from_values(values, default_interval_seconds)
+
+    claude_source = _first_source_for_provider(sources, "claude")
+    codex_source = _first_source_for_provider(sources, "codex")
+    cursor_source = _first_source_for_provider(sources, "cursor")
+
+    cache_dir = Path(
+        _coalesce(
+            explicit_values.get("AGENT_USAGE_CACHE_DIR"),
+            storage_config.get("cache_dir"),
+            poller_config.get("cache_dir"),
+            values.get("AGENT_USAGE_CACHE_DIR"),
+            str(DEFAULT_CACHE_DIR),
+        )
+    ).expanduser()
+    state_path = Path(
+        _coalesce(
+            explicit_values.get("AGENT_USAGE_STATE_FILE"),
+            storage_config.get("state_file"),
+            poller_config.get("state_file"),
+            values.get("AGENT_USAGE_STATE_FILE"),
+            str(cache_dir / "state.json"),
+        )
+    ).expanduser()
 
     return AppConfig(
+        config_file=config_file,
         env_file=env_file,
         cache_dir=cache_dir,
         state_path=state_path,
-        db_dsn=_coalesce(values.get("AGENT_USAGE_DB_DSN"), DEFAULT_DB_DSN),
-        service_host=_coalesce(values.get("AGENT_USAGE_SERVICE_HOST"), DEFAULT_SERVICE_HOST),
-        service_port=int(_coalesce(values.get("AGENT_USAGE_SERVICE_PORT"), str(DEFAULT_SERVICE_PORT))),
-        claude_enabled=_bool_value(values.get("AGENT_USAGE_ENABLE_CLAUDE", "0"), False),
-        codex_enabled=_bool_value(values.get("AGENT_USAGE_ENABLE_CODEX", "0"), False),
-        cursor_enabled=_bool_value(values.get("AGENT_USAGE_ENABLE_CURSOR", "0"), False),
-        claude_organization_id=_coalesce(values.get("AGENT_USAGE_CLAUDE_ORGANIZATION_ID")),
-        claude_anonymous_id=_coalesce(values.get("AGENT_USAGE_CLAUDE_ANONYMOUS_ID")),
-        claude_device_id=_coalesce(values.get("AGENT_USAGE_CLAUDE_DEVICE_ID")),
-        claude_session_key=_coalesce(values.get("AGENT_USAGE_CLAUDE_SESSION_KEY")),
-        claude_cookie=_coalesce(values.get("AGENT_USAGE_CLAUDE_COOKIE")),
-        claude_headers_json=_coalesce(values.get("AGENT_USAGE_CLAUDE_HEADERS_JSON")),
-        codex_account_id=_coalesce(values.get("AGENT_USAGE_CODEX_ACCOUNT_ID")),
-        codex_authorization=_coalesce(values.get("AGENT_USAGE_CODEX_AUTHORIZATION")),
-        codex_device_id=_coalesce(values.get("AGENT_USAGE_CODEX_DEVICE_ID")),
-        codex_session_id=_coalesce(values.get("AGENT_USAGE_CODEX_SESSION_ID")),
-        codex_cookie=_coalesce(values.get("AGENT_USAGE_CODEX_COOKIE")),
-        codex_headers_json=_coalesce(values.get("AGENT_USAGE_CODEX_HEADERS_JSON")),
-        codex_oai_session_id=_coalesce(values.get("AGENT_USAGE_CODEX_OAI_SESSION_ID")) or None,
-        cursor_cookie=_coalesce(values.get("AGENT_USAGE_CURSOR_COOKIE")),
-        cursor_headers_json=_coalesce(values.get("AGENT_USAGE_CURSOR_HEADERS_JSON")),
+        db_dsn=_coalesce(
+            explicit_values.get("AGENT_USAGE_DB_DSN"),
+            storage_config.get("db_dsn"),
+            service_config.get("db_dsn"),
+            values.get("AGENT_USAGE_DB_DSN"),
+            DEFAULT_DB_DSN,
+        ),
+        service_host=_coalesce(
+            explicit_values.get("AGENT_USAGE_SERVICE_HOST"),
+            service_config.get("host"),
+            values.get("AGENT_USAGE_SERVICE_HOST"),
+            DEFAULT_SERVICE_HOST,
+        ),
+        service_port=int(
+            _coalesce(
+                explicit_values.get("AGENT_USAGE_SERVICE_PORT"),
+                service_config.get("port"),
+                values.get("AGENT_USAGE_SERVICE_PORT"),
+                str(DEFAULT_SERVICE_PORT),
+            )
+        ),
+        claude_enabled=bool(claude_source and claude_source.enabled),
+        codex_enabled=bool(codex_source and codex_source.enabled),
+        cursor_enabled=bool(cursor_source and cursor_source.enabled),
+        claude_organization_id=_coalesce(
+            explicit_values.get("AGENT_USAGE_CLAUDE_ORGANIZATION_ID"),
+            _source_auth_value(claude_source, "organization_id", "org_id"),
+            values.get("AGENT_USAGE_CLAUDE_ORGANIZATION_ID"),
+        ),
+        claude_anonymous_id=_coalesce(
+            explicit_values.get("AGENT_USAGE_CLAUDE_ANONYMOUS_ID"),
+            _source_auth_value(claude_source, "anonymous_id"),
+            values.get("AGENT_USAGE_CLAUDE_ANONYMOUS_ID"),
+        ),
+        claude_device_id=_coalesce(
+            explicit_values.get("AGENT_USAGE_CLAUDE_DEVICE_ID"),
+            _source_auth_value(claude_source, "device_id"),
+            values.get("AGENT_USAGE_CLAUDE_DEVICE_ID"),
+        ),
+        claude_session_key=_coalesce(
+            explicit_values.get("AGENT_USAGE_CLAUDE_SESSION_KEY"),
+            _source_auth_value(claude_source, "session_key"),
+            values.get("AGENT_USAGE_CLAUDE_SESSION_KEY"),
+        ),
+        claude_cookie=_coalesce(
+            explicit_values.get("AGENT_USAGE_CLAUDE_COOKIE"),
+            _source_auth_value(claude_source, "cookie"),
+            values.get("AGENT_USAGE_CLAUDE_COOKIE"),
+        ),
+        claude_headers_json=_coalesce(
+            explicit_values.get("AGENT_USAGE_CLAUDE_HEADERS_JSON"),
+            _source_auth_value(claude_source, "headers_json", "headers"),
+            values.get("AGENT_USAGE_CLAUDE_HEADERS_JSON"),
+        ),
+        codex_account_id=_coalesce(
+            explicit_values.get("AGENT_USAGE_CODEX_ACCOUNT_ID"),
+            _source_auth_value(codex_source, "account_id"),
+            values.get("AGENT_USAGE_CODEX_ACCOUNT_ID"),
+        ),
+        codex_authorization=_coalesce(
+            explicit_values.get("AGENT_USAGE_CODEX_AUTHORIZATION"),
+            _source_auth_value(codex_source, "authorization"),
+            values.get("AGENT_USAGE_CODEX_AUTHORIZATION"),
+        ),
+        codex_device_id=_coalesce(
+            explicit_values.get("AGENT_USAGE_CODEX_DEVICE_ID"),
+            _source_auth_value(codex_source, "device_id"),
+            values.get("AGENT_USAGE_CODEX_DEVICE_ID"),
+        ),
+        codex_session_id=_coalesce(
+            explicit_values.get("AGENT_USAGE_CODEX_SESSION_ID"),
+            _source_auth_value(codex_source, "session_id"),
+            values.get("AGENT_USAGE_CODEX_SESSION_ID"),
+        ),
+        codex_cookie=_coalesce(
+            explicit_values.get("AGENT_USAGE_CODEX_COOKIE"),
+            _source_auth_value(codex_source, "cookie"),
+            values.get("AGENT_USAGE_CODEX_COOKIE"),
+        ),
+        codex_headers_json=_coalesce(
+            explicit_values.get("AGENT_USAGE_CODEX_HEADERS_JSON"),
+            _source_auth_value(codex_source, "headers_json", "headers"),
+            values.get("AGENT_USAGE_CODEX_HEADERS_JSON"),
+        ),
+        codex_oai_session_id=_coalesce(
+            explicit_values.get("AGENT_USAGE_CODEX_OAI_SESSION_ID"),
+            _source_auth_value(codex_source, "oai_session_id"),
+            values.get("AGENT_USAGE_CODEX_OAI_SESSION_ID"),
+        )
+        or None,
+        cursor_cookie=_coalesce(
+            explicit_values.get("AGENT_USAGE_CURSOR_COOKIE"),
+            _source_auth_value(cursor_source, "cookie"),
+            values.get("AGENT_USAGE_CURSOR_COOKIE"),
+        ),
+        cursor_headers_json=_coalesce(
+            explicit_values.get("AGENT_USAGE_CURSOR_HEADERS_JSON"),
+            _source_auth_value(cursor_source, "headers_json", "headers"),
+            values.get("AGENT_USAGE_CURSOR_HEADERS_JSON"),
+        ),
+        poller_default_interval_seconds=default_interval_seconds,
+        sources=sources,
     )
 
 
-def _auth_headers(cfg: AppConfig, provider: str) -> tuple[str, dict[str, str]]:
+def _auth_headers(
+    cfg: AppConfig,
+    provider: str,
+    source: SourceConfig | None = None,
+) -> tuple[str, dict[str, str]]:
     if provider == "claude":
-        cookie_values = _parse_cookie_header(cfg.claude_cookie)
-        organization_id = _coalesce(cfg.claude_organization_id, cookie_values.get("lastActiveOrg"))
-        anonymous_id = _coalesce(cfg.claude_anonymous_id, cookie_values.get("ajs_anonymous_id"))
-        device_id = _coalesce(cfg.claude_device_id, cookie_values.get("anthropic-device-id"))
-        session_key = _coalesce(cfg.claude_session_key, cookie_values.get("sessionKey"))
+        cookie = _coalesce(_source_auth_value(source, "cookie"), cfg.claude_cookie)
+        cookie_values = _parse_cookie_header(cookie)
+        organization_id = _coalesce(
+            _source_auth_value(source, "organization_id", "org_id"),
+            cfg.claude_organization_id,
+            cookie_values.get("lastActiveOrg"),
+        )
+        anonymous_id = _coalesce(
+            _source_auth_value(source, "anonymous_id"),
+            cfg.claude_anonymous_id,
+            cookie_values.get("ajs_anonymous_id"),
+        )
+        device_id = _coalesce(
+            _source_auth_value(source, "device_id"),
+            cfg.claude_device_id,
+            cookie_values.get("anthropic-device-id"),
+        )
+        session_key = _coalesce(
+            _source_auth_value(source, "session_key"),
+            cfg.claude_session_key,
+            cookie_values.get("sessionKey"),
+        )
 
         if not organization_id:
             raise ValueError(
                 "Missing Claude organization config. Set "
-                "AGENT_USAGE_CLAUDE_ORGANIZATION_ID or provide lastActiveOrg in "
-                "AGENT_USAGE_CLAUDE_COOKIE"
+                "sources.<name>.auth.organization_id, AGENT_USAGE_CLAUDE_ORGANIZATION_ID, "
+                "or provide lastActiveOrg in the Claude cookie"
             )
 
         url = f"https://claude.ai/api/organizations/{organization_id}/usage"
-        cookie = cfg.claude_cookie
         if not cookie:
             if not (anonymous_id and device_id and session_key):
                 raise ValueError(
-                    "Missing Claude auth config. Either set AGENT_USAGE_CLAUDE_COOKIE "
-                    "or set AGENT_USAGE_CLAUDE_ORGANIZATION_ID, "
-                    "AGENT_USAGE_CLAUDE_ANONYMOUS_ID, "
-                    "AGENT_USAGE_CLAUDE_DEVICE_ID, and "
-                    "AGENT_USAGE_CLAUDE_SESSION_KEY"
+                    "Missing Claude auth config. Either set sources.<name>.auth.cookie "
+                    "or set organization_id, anonymous_id, device_id, and session_key"
                 )
             cookie = (
                 f"sessionKey={session_key}; "
@@ -759,28 +1087,40 @@ def _auth_headers(cfg: AppConfig, provider: str) -> tuple[str, dict[str, str]]:
             headers["anthropic-anonymous-id"] = anonymous_id
         if device_id:
             headers["anthropic-device-id"] = device_id
-        headers.update(_parse_header_json(cfg.claude_headers_json, "Claude"))
+        headers.update(
+            _parse_header_json(
+                _coalesce(_source_auth_value(source, "headers_json", "headers"), cfg.claude_headers_json),
+                "Claude",
+            )
+        )
         return url, headers
 
     if provider == "codex":
-        cookie_values = _parse_cookie_header(cfg.codex_cookie)
-        device_id = _coalesce(cfg.codex_device_id, cookie_values.get("oai-did"))
-        session_id = _coalesce(cfg.codex_session_id, cookie_values.get("oai-session-id"))
-        header_session_id = _coalesce(cfg.codex_oai_session_id, session_id)
+        authorization = _coalesce(_source_auth_value(source, "authorization"), cfg.codex_authorization)
+        cookie = _coalesce(_source_auth_value(source, "cookie"), cfg.codex_cookie)
+        cookie_values = _parse_cookie_header(cookie)
+        device_id = _coalesce(
+            _source_auth_value(source, "device_id"),
+            cfg.codex_device_id,
+            cookie_values.get("oai-did"),
+        )
+        session_id = _coalesce(
+            _source_auth_value(source, "session_id"),
+            cfg.codex_session_id,
+            cookie_values.get("oai-session-id"),
+        )
+        header_session_id = _coalesce(_source_auth_value(source, "oai_session_id"), cfg.codex_oai_session_id, session_id)
 
-        if not (cfg.codex_authorization and device_id and header_session_id):
+        if not (authorization and device_id and header_session_id):
             raise ValueError(
-                "Missing Codex auth config. Set "
-                "AGENT_USAGE_CODEX_AUTHORIZATION, "
-                "and either AGENT_USAGE_CODEX_COOKIE or "
-                "AGENT_USAGE_CODEX_DEVICE_ID plus AGENT_USAGE_CODEX_SESSION_ID"
+                "Missing Codex auth config. Set sources.<name>.auth.authorization, "
+                "and either cookie or device_id plus session_id"
             )
 
         url = "https://chatgpt.com/backend-api/wham/usage"
-        token = cfg.codex_authorization.strip()
+        token = authorization.strip()
         if not re.match(r"(?i)^bearer\s+", token):
             token = f"Bearer {token}"
-        cookie = cfg.codex_cookie
         if not cookie:
             cookie = (
                 f"oai-did={device_id}; "
@@ -804,14 +1144,19 @@ def _auth_headers(cfg: AppConfig, provider: str) -> tuple[str, dict[str, str]]:
             "x-openai-target-page": "/backend-api/wham/usage",
             "cookie": cookie,
         }
-        headers.update(_parse_header_json(cfg.codex_headers_json, "Codex"))
+        headers.update(
+            _parse_header_json(
+                _coalesce(_source_auth_value(source, "headers_json", "headers"), cfg.codex_headers_json),
+                "Codex",
+            )
+        )
         return url, headers
 
     if provider == "cursor":
-        if not cfg.cursor_cookie:
+        cursor_cookie = _coalesce(_source_auth_value(source, "cookie"), cfg.cursor_cookie)
+        if not cursor_cookie:
             raise ValueError(
-                "Missing Cursor auth config. Set "
-                "AGENT_USAGE_CURSOR_COOKIE"
+                "Missing Cursor auth config. Set sources.<name>.auth.cookie or AGENT_USAGE_CURSOR_COOKIE"
             )
 
         url = "https://cursor.com/api/usage-summary"
@@ -823,9 +1168,14 @@ def _auth_headers(cfg: AppConfig, provider: str) -> tuple[str, dict[str, str]]:
             "origin": "https://cursor.com",
             "referer": "https://cursor.com/dashboard/billing",
             "user-agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
-            "cookie": cfg.cursor_cookie,
+            "cookie": cursor_cookie,
         }
-        headers.update(_parse_header_json(cfg.cursor_headers_json, "Cursor"))
+        headers.update(
+            _parse_header_json(
+                _coalesce(_source_auth_value(source, "headers_json", "headers"), cfg.cursor_headers_json),
+                "Cursor",
+            )
+        )
         return url, headers
 
     raise ValueError(f"Unknown provider {provider}")
@@ -869,8 +1219,9 @@ def fetch_cursor_usage_events_page(
     end_epoch_ms: int,
     page: int,
     page_size: int = 100,
+    source: SourceConfig | None = None,
 ) -> tuple[int, dict[str, Any], str | None]:
-    _, headers = _auth_headers(cfg, "cursor")
+    _, headers = _auth_headers(cfg, "cursor", source=source)
     headers["content-type"] = "application/json"
     headers["referer"] = "https://cursor.com/dashboard/usage"
     body = json.dumps(
@@ -897,10 +1248,19 @@ def _cursor_usage_event_id(event: dict[str, Any]) -> str:
     return hashlib.sha1(canonical.encode("utf-8")).hexdigest()
 
 
-def normalize_claude(payload: dict[str, Any], cfg: AppConfig, fetch_url: str, status: int, error: str | None) -> ProviderSnapshot:
+def normalize_claude(
+    payload: dict[str, Any],
+    cfg: AppConfig,
+    fetch_url: str,
+    status: int,
+    error: str | None,
+    source: SourceConfig | None = None,
+) -> ProviderSnapshot:
     data = _safe_json(payload)
     metrics = _collect_metric_rows("claude", data)
-    organization_id = _claude_organization_id(cfg, fetch_url)
+    source_id = source.source_id if source else "claude"
+    source_label = source.label if source else "Claude"
+    organization_id = _claude_organization_id(cfg, fetch_url, source=source)
     if not metrics:
         metrics.append(
             {
@@ -930,6 +1290,9 @@ def normalize_claude(payload: dict[str, Any], cfg: AppConfig, fetch_url: str, st
     summary_key = _pick_summary_key("claude", metrics)
     history_key = summary_key
     metadata = {
+        "source_id": source_id,
+        "source_label": source_label,
+        "frontend_visible": source.frontend_visible if source else True,
         "provider": "claude",
         "plan": _coalesce(data.get("plan")),
         "summary_key": summary_key,
@@ -960,6 +1323,9 @@ def normalize_claude(payload: dict[str, Any], cfg: AppConfig, fetch_url: str, st
         request_error=error,
         request_metadata=metadata,
         success=status == 200 and not bool(error),
+        source_id=source_id,
+        source_label=source_label,
+        frontend_visible=source.frontend_visible if source else True,
     )
 
 
@@ -990,9 +1356,19 @@ def _percent_from_usage_dict(raw: Any) -> int:
         return 0
 
 
-def normalize_codex(payload: dict[str, Any], cfg: AppConfig, fetch_url: str, status: int, error: str | None) -> ProviderSnapshot:
+def normalize_codex(
+    payload: dict[str, Any],
+    cfg: AppConfig,
+    fetch_url: str,
+    status: int,
+    error: str | None,
+    source: SourceConfig | None = None,
+) -> ProviderSnapshot:
     data = _safe_json(payload)
     metrics = _collect_metric_rows("codex", data)
+    source_id = source.source_id if source else "codex"
+    source_label = source.label if source else "Codex"
+    configured_account_id = _coalesce(_source_auth_value(source, "account_id"), cfg.codex_account_id)
     if not metrics:
         metrics.append(
             {
@@ -1021,7 +1397,12 @@ def normalize_codex(payload: dict[str, Any], cfg: AppConfig, fetch_url: str, sta
 
     summary_key = _pick_summary_key("codex", metrics)
     history_key = summary_key
+    account_id = _coalesce(data.get("account_id"), configured_account_id)
+    organization_id = _coalesce(data.get("user_id"), configured_account_id, account_id)
     metadata = {
+        "source_id": source_id,
+        "source_label": source_label,
+        "frontend_visible": source.frontend_visible if source else True,
         "provider": "codex",
         "plan": _coalesce(data.get("plan_type"), "Pro"),
         "summary_key": summary_key,
@@ -1030,7 +1411,7 @@ def normalize_codex(payload: dict[str, Any], cfg: AppConfig, fetch_url: str, sta
         "details": details,
         "primary_window_pct": primary_pct,
         "secondary_window_pct": secondary_pct,
-        "account_id": data.get("account_id", cfg.codex_account_id),
+        "account_id": account_id,
         "user_id": data.get("user_id"),
     }
     metadata["success_status"] = {
@@ -1041,8 +1422,8 @@ def normalize_codex(payload: dict[str, Any], cfg: AppConfig, fetch_url: str, sta
 
     return ProviderSnapshot(
         provider="codex",
-        account_id=data.get("account_id", cfg.codex_account_id),
-        organization_id=data.get("user_id", cfg.codex_account_id),
+        account_id=account_id,
+        organization_id=organization_id,
         metrics=metrics,
         summary_key=summary_key,
         history_key=history_key,
@@ -1054,12 +1435,24 @@ def normalize_codex(payload: dict[str, Any], cfg: AppConfig, fetch_url: str, sta
         request_error=error,
         request_metadata=metadata,
         success=status == 200 and not bool(error),
+        source_id=source_id,
+        source_label=source_label,
+        frontend_visible=source.frontend_visible if source else True,
     )
 
 
-def normalize_cursor(payload: dict[str, Any], cfg: AppConfig, fetch_url: str, status: int, error: str | None) -> ProviderSnapshot:
+def normalize_cursor(
+    payload: dict[str, Any],
+    cfg: AppConfig,
+    fetch_url: str,
+    status: int,
+    error: str | None,
+    source: SourceConfig | None = None,
+) -> ProviderSnapshot:
     data = _safe_json(payload)
     metrics = []
+    source_id = source.source_id if source else "cursor"
+    source_label = source.label if source else "Cursor"
 
     individual = _safe_json(data.get("individualUsage"))
     plan = _safe_json(individual.get("plan"))
@@ -1210,7 +1603,7 @@ def normalize_cursor(payload: dict[str, Any], cfg: AppConfig, fetch_url: str, st
             if start_dt:
                 start_epoch = int(start_dt.timestamp() * 1000)
                 events_url = "https://cursor.com/api/dashboard/get-aggregated-usage-events"
-                _, headers = _auth_headers(cfg, "cursor")
+                _, headers = _auth_headers(cfg, "cursor", source=source)
                 headers["content-type"] = "application/json"
                 post_data = json.dumps({"teamId": -1, "startDate": start_epoch}).encode("utf-8")
                 ev_status, events_payload, _ = fetch_json(events_url, headers, data=post_data)
@@ -1299,7 +1692,7 @@ def normalize_cursor(payload: dict[str, Any], cfg: AppConfig, fetch_url: str, st
         individual.get("user_id"),
         individual.get("accountId"),
         individual.get("account_id"),
-        _fingerprint_identity("cursor_user", cfg.cursor_cookie),
+        _fingerprint_identity("cursor_user", _coalesce(_source_auth_value(source, "cookie"), cfg.cursor_cookie)),
     )
     organization_id = _coalesce(
         data.get("teamId"),
@@ -1317,6 +1710,9 @@ def normalize_cursor(payload: dict[str, Any], cfg: AppConfig, fetch_url: str, st
     summary_key = "monthly"
     history_key = summary_key
     metadata = {
+        "source_id": source_id,
+        "source_label": source_label,
+        "frontend_visible": source.frontend_visible if source else True,
         "provider": "cursor",
         "plan": str(data.get("membershipType", "Pro")).title(),
         "summary_key": summary_key,
@@ -1346,17 +1742,24 @@ def normalize_cursor(payload: dict[str, Any], cfg: AppConfig, fetch_url: str, st
         request_error=error,
         request_metadata=metadata,
         success=status == 200 and not bool(error),
+        source_id=source_id,
+        source_label=source_label,
+        frontend_visible=source.frontend_visible if source else True,
     )
 
 
-def run_fetch(cfg: AppConfig, provider: str) -> ProviderSnapshot:
-    fetch_url, headers = _auth_headers(cfg, provider)
+def run_fetch(
+    cfg: AppConfig,
+    provider: str,
+    source: SourceConfig | None = None,
+) -> ProviderSnapshot:
+    fetch_url, headers = _auth_headers(cfg, provider, source=source)
     status, payload, error = fetch_json(fetch_url, headers)
     if provider == "claude":
-        return normalize_claude(payload, cfg=cfg, fetch_url=fetch_url, status=status, error=error)
+        return normalize_claude(payload, cfg=cfg, fetch_url=fetch_url, status=status, error=error, source=source)
     if provider == "cursor":
-        return normalize_cursor(payload, cfg=cfg, fetch_url=fetch_url, status=status, error=error)
-    return normalize_codex(payload, cfg=cfg, fetch_url=fetch_url, status=status, error=error)
+        return normalize_cursor(payload, cfg=cfg, fetch_url=fetch_url, status=status, error=error, source=source)
+    return normalize_codex(payload, cfg=cfg, fetch_url=fetch_url, status=status, error=error, source=source)
 
 
 def sync_cursor_usage_events(
@@ -1378,9 +1781,10 @@ def sync_cursor_usage_events(
     if start_epoch_ms is None or end_epoch_ms is None or not cycle_end:
         return {"pages_fetched": 0, "inserted": 0, "known_through": 0, "oldest_seen": 0, "total_events": 0}
 
-    known_through = client.latest_cursor_usage_sync_through(cycle_end)
-    known_total = client.latest_cursor_usage_total_count(cycle_end)
-    known_latest = client.latest_cursor_usage_timestamp(cycle_end)
+    source_id = _coalesce(snapshot.source_id, snapshot.provider)
+    known_through = client.latest_cursor_usage_sync_through(cycle_end, source_id=source_id)
+    known_total = client.latest_cursor_usage_total_count(cycle_end, source_id=source_id)
+    known_latest = client.latest_cursor_usage_timestamp(cycle_end, source_id=source_id)
     pages_fetched = 0
     inserted_total = 0
     oldest_seen = 0
@@ -1394,6 +1798,7 @@ def sync_cursor_usage_events(
             end_epoch_ms=end_epoch_ms,
             page=page,
             page_size=page_size,
+            source=next((candidate for candidate in cfg.sources if candidate.source_id == source_id), None),
         )
         if status != 200 or error:
             break
@@ -1407,6 +1812,7 @@ def sync_cursor_usage_events(
         seen_events += len(events)
         inserted_total += client.insert_cursor_usage_events(
             provider_fetch_id=provider_fetch_id,
+            source_id=source_id,
             cycle_start=cycle_start,
             cycle_end=cycle_end,
             page=page,
@@ -1429,6 +1835,7 @@ def sync_cursor_usage_events(
     if oldest_seen:
         synced_through = min(oldest_seen, known_through) if known_through else oldest_seen
         client.update_cursor_usage_sync_state(
+            source_id=source_id,
             cycle_start=cycle_start,
             cycle_end=cycle_end,
             synced_through_timestamp_ms=synced_through,
@@ -1839,6 +2246,8 @@ def build_state_agent(
     short_label = "Cl" if snapshot.provider == "claude" else "Cx" if snapshot.provider == "codex" else "Cu"
     plan = snapshot.request_metadata.get("plan", "Pro")
     summary_label = "Monthly usage" if snapshot.provider == "cursor" else "Weekly usage"
+    source_id = _coalesce(snapshot.source_id, snapshot.provider)
+    label = _coalesce(snapshot.source_label, snapshot.request_metadata.get("source_label"), snapshot.provider.title())
     long_metric = _pick_graph_metric(snapshot.metrics, snapshot.provider, "long_window")
     short_metric = _pick_graph_metric(snapshot.metrics, snapshot.provider, "short_window")
     graphs: dict[str, Any] = {}
@@ -1848,8 +2257,10 @@ def build_state_agent(
         graphs["short_window"] = _graph_from_metric(short_metric, graph_points.get(short_metric.get("metric_path") or short_metric.get("metric_key"), []))
 
     return {
-        "id": snapshot.provider,
-        "label": snapshot.provider.title(),
+        "id": source_id,
+        "source_id": source_id,
+        "provider": snapshot.provider,
+        "label": label,
         "short_label": short_label,
         "accent": accent,
         "plan": plan,
@@ -2052,13 +2463,18 @@ SELECT COUNT(*) FROM updated;
         return int(result or 0)
 
     def persist_snapshot(self, snapshot: ProviderSnapshot) -> int:
+        source_id = _coalesce(snapshot.source_id, snapshot.provider)
+        metadata = dict(snapshot.request_metadata)
+        metadata.setdefault("source_id", source_id)
+        metadata.setdefault("source_label", _coalesce(snapshot.source_label, source_id))
+        metadata.setdefault("frontend_visible", snapshot.frontend_visible)
         sql_lines = [
             "BEGIN;",
             r"""
 INSERT INTO usage_provider_fetch
-  (provider, account_id, organization_id, requested_url, http_status, request_error, raw_payload, request_metadata, success)
+  (source_id, provider, account_id, organization_id, requested_url, http_status, request_error, raw_payload, request_metadata, success)
 VALUES
-  (:'provider', :'account_id', :'organization_id', :'request_url', :status, :'error',
+  (:'source_id', :'provider', :'account_id', :'organization_id', :'request_url', :status, :'error',
    convert_from(decode(:'payload_b64', 'base64'), 'UTF8')::jsonb,
    convert_from(decode(:'metadata_b64', 'base64'), 'UTF8')::jsonb,
    :success)
@@ -2068,6 +2484,7 @@ RETURNING id AS fetch_id
         ]
 
         vars = {
+            "source_id": source_id,
             "provider": snapshot.provider,
             "account_id": snapshot.account_id,
             "organization_id": snapshot.organization_id,
@@ -2075,7 +2492,7 @@ RETURNING id AS fetch_id
             "status": str(snapshot.request_status),
             "error": _coalesce(snapshot.request_error),
             "payload_b64": _to_base64_json(snapshot.raw_payload),
-            "metadata_b64": _to_base64_json(snapshot.request_metadata),
+            "metadata_b64": _to_base64_json(metadata),
             "success": ("true" if snapshot.success else "false"),
         }
 
@@ -2084,13 +2501,14 @@ RETURNING id AS fetch_id
             sql_lines.append(
                 f"""
 INSERT INTO usage_metric_snapshot
-  (provider_fetch_id, provider, metric_key, provider_metric_key, metric_path, metric_scope, metric_label, percent, value_num, value_text, note, max_value, window_start, window_end, reset_at, details)
+  (provider_fetch_id, source_id, provider, metric_key, provider_metric_key, metric_path, metric_scope, metric_label, percent, value_num, value_text, note, max_value, window_start, window_end, reset_at, details)
 VALUES
-  (:fetch_id, :'provider_{idx}', :'metric_key_{idx}', :'provider_metric_key_{idx}', :'metric_path_{idx}', :'metric_scope_{idx}', :'metric_label_{idx}', :percent_{idx}, NULLIF(:'value_num_{idx}', '')::double precision, :'value_text_{idx}', :'note_{idx}', :max_value_{idx}, NULLIF(:'window_start_{idx}', '')::timestamptz, NULLIF(:'window_end_{idx}', '')::timestamptz, NULLIF(:'reset_at_{idx}', '')::timestamptz, convert_from(decode(:'details_b64_{idx}', 'base64'), 'UTF8')::jsonb);
+  (:fetch_id, :'source_id_{idx}', :'provider_{idx}', :'metric_key_{idx}', :'provider_metric_key_{idx}', :'metric_path_{idx}', :'metric_scope_{idx}', :'metric_label_{idx}', :percent_{idx}, NULLIF(:'value_num_{idx}', '')::double precision, :'value_text_{idx}', :'note_{idx}', :max_value_{idx}, NULLIF(:'window_start_{idx}', '')::timestamptz, NULLIF(:'window_end_{idx}', '')::timestamptz, NULLIF(:'reset_at_{idx}', '')::timestamptz, convert_from(decode(:'details_b64_{idx}', 'base64'), 'UTF8')::jsonb);
 """.strip()
             )
             vars.update(
                 {
+                    f"source_id_{idx}": source_id,
                     f"provider_{idx}": snapshot.provider,
                     f"metric_key_{idx}": metric["metric_key"],
                     f"provider_metric_key_{idx}": metric.get("provider_metric_key", metric["metric_key"]),
@@ -2122,11 +2540,16 @@ VALUES
         return int(parsed)
 
     def insert_provider_fetch(self, snapshot: ProviderSnapshot) -> int:
+        source_id = _coalesce(snapshot.source_id, snapshot.provider)
+        metadata = dict(snapshot.request_metadata)
+        metadata.setdefault("source_id", source_id)
+        metadata.setdefault("source_label", _coalesce(snapshot.source_label, source_id))
+        metadata.setdefault("frontend_visible", snapshot.frontend_visible)
         sql = """
 INSERT INTO usage_provider_fetch
-  (provider, account_id, organization_id, requested_url, http_status, request_error, raw_payload, request_metadata, success)
+  (source_id, provider, account_id, organization_id, requested_url, http_status, request_error, raw_payload, request_metadata, success)
 VALUES
-  (:'provider', :'account_id', :'organization_id', :'request_url', :status, :'error',
+  (:'source_id', :'provider', :'account_id', :'organization_id', :'request_url', :status, :'error',
    convert_from(decode(:'payload_b64', 'base64'), 'UTF8')::jsonb,
    convert_from(decode(:'metadata_b64', 'base64'), 'UTF8')::jsonb,
    :success)
@@ -2135,6 +2558,7 @@ RETURNING id;
         out = self._run(
             sql,
             vars={
+                "source_id": source_id,
                 "provider": snapshot.provider,
                 "account_id": snapshot.account_id,
                 "organization_id": snapshot.organization_id,
@@ -2142,7 +2566,7 @@ RETURNING id;
                 "status": str(snapshot.request_status),
                 "error": _coalesce(snapshot.request_error),
                 "payload_b64": _to_base64_json(snapshot.raw_payload),
-                "metadata_b64": _to_base64_json(snapshot.request_metadata),
+                "metadata_b64": _to_base64_json(metadata),
                 "success": ("true" if snapshot.success else "false"),
             },
         )
@@ -2152,11 +2576,12 @@ RETURNING id;
         return int(parsed)
 
     def insert_metric_snapshot(self, provider_fetch_id: int, snapshot: ProviderSnapshot) -> None:
+        source_id = _coalesce(snapshot.source_id, snapshot.provider)
         sql = """
 INSERT INTO usage_metric_snapshot
-  (provider_fetch_id, provider, metric_key, provider_metric_key, metric_path, metric_scope, metric_label, percent, value_num, value_text, note, max_value, window_start, window_end, reset_at, details)
+  (provider_fetch_id, source_id, provider, metric_key, provider_metric_key, metric_path, metric_scope, metric_label, percent, value_num, value_text, note, max_value, window_start, window_end, reset_at, details)
 VALUES
-  (:'provider_fetch_id', :'provider', :'metric_key', :'provider_metric_key', :'metric_path', :'metric_scope', :'metric_label', :percent, NULLIF(:'value_num', '')::double precision, :'value_text', :'note', :max_value, NULLIF(:'window_start', '')::timestamptz, NULLIF(:'window_end', '')::timestamptz, NULLIF(:'reset_at', '')::timestamptz, convert_from(decode(:'details_b64', 'base64'), 'UTF8')::jsonb)
+  (:'provider_fetch_id', :'source_id', :'provider', :'metric_key', :'provider_metric_key', :'metric_path', :'metric_scope', :'metric_label', :percent, NULLIF(:'value_num', '')::double precision, :'value_text', :'note', :max_value, NULLIF(:'window_start', '')::timestamptz, NULLIF(:'window_end', '')::timestamptz, NULLIF(:'reset_at', '')::timestamptz, convert_from(decode(:'details_b64', 'base64'), 'UTF8')::jsonb)
 """
         for metric in snapshot.metrics:
             reset_at = metric.get("reset_at")
@@ -2164,6 +2589,7 @@ VALUES
                 sql,
                 vars={
                     "provider_fetch_id": str(provider_fetch_id),
+                    "source_id": source_id,
                     "provider": snapshot.provider,
                     "metric_key": metric["metric_key"],
                     "provider_metric_key": metric.get("provider_metric_key", metric["metric_key"]),
@@ -2182,12 +2608,37 @@ VALUES
                 },
             )
 
-    def latest_fetch(self) -> list[dict[str, Any]]:
+    def _sql_in_filter(
+        self,
+        column: str,
+        prefix: str,
+        values: list[str] | tuple[str, ...] | None,
+        vars: dict[str, str],
+    ) -> str:
+        cleaned = [_coalesce(value) for value in (values or []) if _coalesce(value)]
+        if not cleaned:
+            return ""
+        placeholders: list[str] = []
+        for idx, value in enumerate(cleaned):
+            key = f"{prefix}_{idx}"
+            vars[key] = value
+            placeholders.append(f":'{key}'")
+        return f"\n    AND {column} IN ({', '.join(placeholders)})"
+
+    def latest_fetch(
+        self,
+        source_ids: list[str] | tuple[str, ...] | None = None,
+        providers: list[str] | tuple[str, ...] | None = None,
+    ) -> list[dict[str, Any]]:
+        vars: dict[str, str] = {}
+        filter_sql = self._sql_in_filter("source_id", "source", source_ids, vars)
+        filter_sql += self._sql_in_filter("provider", "provider", providers, vars)
         sql = """
-SELECT COALESCE(json_agg(row_to_json(t) ORDER BY provider), '[]'::json)
+SELECT COALESCE(json_agg(row_to_json(t) ORDER BY provider, source_id), '[]'::json)
 FROM (
   SELECT
     f.id,
+    f.source_id,
     f.provider,
     f.fetched_at,
     f.account_id,
@@ -2195,8 +2646,9 @@ FROM (
     f.request_metadata,
     f.request_error
   FROM (
-    SELECT DISTINCT ON (provider)
+    SELECT DISTINCT ON (source_id)
       id,
+      source_id,
       provider,
       fetched_at,
       account_id,
@@ -2205,27 +2657,45 @@ FROM (
       request_error
     FROM usage_provider_fetch
     WHERE success = true
+__FILTER_SQL__
     ORDER BY
-      provider,
+      source_id,
       CASE WHEN requested_url LIKE 'legacy://%' THEN 1 ELSE 0 END,
       fetched_at DESC,
       id DESC
   ) AS f
 ) t;
 """
-        return _parse_psql_json(self._run(sql))
+        return _parse_psql_json(self._run(sql.replace("__FILTER_SQL__", filter_sql), vars=vars or None))
 
-    def latest_provider_fetch(self, provider: str) -> dict[str, Any] | None:
-        latest = {row["provider"]: row for row in self.latest_fetch()}
-        row = latest.get(provider)
+    def latest_source_fetch(self, source_id: str) -> dict[str, Any] | None:
+        rows = self.latest_fetch(source_ids=[source_id])
+        row = rows[0] if rows else None
         return row if isinstance(row, dict) else None
 
-    def latest_attempts(self) -> list[dict[str, Any]]:
+    def latest_provider_fetch(self, provider: str, source_id: str | None = None) -> dict[str, Any] | None:
+        if source_id:
+            return self.latest_source_fetch(source_id)
+        rows = self.latest_fetch(providers=[provider])
+        if not rows:
+            return None
+        row = sorted(rows, key=lambda item: (str(item.get("fetched_at", "")), int(item.get("id", 0))))[-1]
+        return row if isinstance(row, dict) else None
+
+    def latest_attempts(
+        self,
+        source_ids: list[str] | tuple[str, ...] | None = None,
+        providers: list[str] | tuple[str, ...] | None = None,
+    ) -> list[dict[str, Any]]:
+        vars: dict[str, str] = {}
+        filter_sql = self._sql_in_filter("source_id", "source", source_ids, vars)
+        filter_sql += self._sql_in_filter("provider", "provider", providers, vars)
         sql = """
-SELECT COALESCE(json_agg(row_to_json(t) ORDER BY provider), '[]'::json)
+SELECT COALESCE(json_agg(row_to_json(t) ORDER BY provider, source_id), '[]'::json)
 FROM (
   SELECT
     f.id,
+    f.source_id,
     f.provider,
     f.fetched_at,
     f.success,
@@ -2236,8 +2706,9 @@ FROM (
     f.request_error,
     f.raw_payload
   FROM (
-    SELECT DISTINCT ON (provider)
+    SELECT DISTINCT ON (source_id)
       id,
+      source_id,
       provider,
       fetched_at,
       success,
@@ -2249,21 +2720,29 @@ FROM (
       raw_payload,
       requested_url
     FROM usage_provider_fetch
+    WHERE true
+__FILTER_SQL__
     ORDER BY
-      provider,
+      source_id,
       CASE WHEN requested_url LIKE 'legacy://%' THEN 1 ELSE 0 END,
       fetched_at DESC,
       id DESC
   ) AS f
 ) t;
 """
-        return _parse_psql_json(self._run(sql))
+        return _parse_psql_json(self._run(sql.replace("__FILTER_SQL__", filter_sql), vars=vars or None))
+
+    def latest_source_attempt(self, source_id: str) -> dict[str, Any] | None:
+        rows = self.latest_attempts(source_ids=[source_id])
+        row = rows[0] if rows else None
+        return row if isinstance(row, dict) else None
 
     def latest_metrics(self, fetch_id: int) -> list[dict[str, Any]]:
         sql = """
 SELECT COALESCE(json_agg(row_to_json(t) ORDER BY metric_key), '[]'::json)
 FROM (
   SELECT
+    source_id,
     metric_key,
     provider_metric_key,
     metric_path,
@@ -2289,11 +2768,15 @@ FROM (
         self,
         provider: str,
         metric: str,
+        source_id: str | None = None,
         account_id: str | None = None,
         organization_id: str | None = None,
     ) -> dict[str, Any] | None:
         scope_sql = ""
         vars = {"provider": provider, "metric": metric}
+        if source_id:
+            scope_sql += "\n    AND f.source_id = :'source_id'"
+            vars["source_id"] = source_id
         if account_id:
             scope_sql += "\n    AND f.account_id = :'account_id'"
             vars["account_id"] = account_id
@@ -2305,6 +2788,7 @@ SELECT COALESCE(row_to_json(x), '{}'::json)
 FROM (
   SELECT
     m.metric_key,
+    m.source_id,
     m.provider_metric_key,
     m.metric_label,
     m.percent,
@@ -2338,7 +2822,7 @@ __SCOPE_SQL__
             return result[0]
         return None
 
-    def latest_cursor_usage_sync_through(self, cycle_end: str | None) -> int:
+    def latest_cursor_usage_sync_through(self, cycle_end: str | None, source_id: str = "cursor") -> int:
         if not cycle_end:
             return 0
         sql = """
@@ -2346,14 +2830,15 @@ SELECT COALESCE((
   SELECT synced_through_timestamp_ms
   FROM cursor_usage_sync_state
   WHERE cycle_end = NULLIF(:'cycle_end', '')::timestamptz
+    AND source_id = :'source_id'
 ), 0);
 """
-        result = _parse_psql_json(self._run(sql, vars={"cycle_end": cycle_end}))
+        result = _parse_psql_json(self._run(sql, vars={"cycle_end": cycle_end, "source_id": source_id}))
         if isinstance(result, list):
             return int(result[0] or 0) if result else 0
         return int(result or 0)
 
-    def latest_cursor_usage_total_count(self, cycle_end: str | None) -> int:
+    def latest_cursor_usage_total_count(self, cycle_end: str | None, source_id: str = "cursor") -> int:
         if not cycle_end:
             return 0
         sql = """
@@ -2361,22 +2846,24 @@ SELECT COALESCE((
   SELECT total_usage_events_count
   FROM cursor_usage_sync_state
   WHERE cycle_end = NULLIF(:'cycle_end', '')::timestamptz
+    AND source_id = :'source_id'
 ), 0);
 """
-        result = _parse_psql_json(self._run(sql, vars={"cycle_end": cycle_end}))
+        result = _parse_psql_json(self._run(sql, vars={"cycle_end": cycle_end, "source_id": source_id}))
         if isinstance(result, list):
             return int(result[0] or 0) if result else 0
         return int(result or 0)
 
-    def latest_cursor_usage_timestamp(self, cycle_end: str | None) -> int:
+    def latest_cursor_usage_timestamp(self, cycle_end: str | None, source_id: str = "cursor") -> int:
         if not cycle_end:
             return 0
         sql = """
 SELECT COALESCE(MAX(event_timestamp_ms), 0)
 FROM cursor_usage_event
-WHERE cycle_end = NULLIF(:'cycle_end', '')::timestamptz;
+WHERE cycle_end = NULLIF(:'cycle_end', '')::timestamptz
+  AND source_id = :'source_id';
 """
-        result = _parse_psql_json(self._run(sql, vars={"cycle_end": cycle_end}))
+        result = _parse_psql_json(self._run(sql, vars={"cycle_end": cycle_end, "source_id": source_id}))
         if isinstance(result, list):
             return int(result[0] or 0) if result else 0
         return int(result or 0)
@@ -2384,6 +2871,7 @@ WHERE cycle_end = NULLIF(:'cycle_end', '')::timestamptz;
     def insert_cursor_usage_events(
         self,
         provider_fetch_id: int,
+        source_id: str,
         cycle_start: str | None,
         cycle_end: str | None,
         page: int,
@@ -2391,10 +2879,10 @@ WHERE cycle_end = NULLIF(:'cycle_end', '')::timestamptz;
     ) -> int:
         sql = """
 INSERT INTO cursor_usage_event
-  (provider_fetch_id, event_id, event_timestamp, event_timestamp_ms, cycle_start, cycle_end, page, model, kind, charged_cents, is_chargeable, is_headless, is_token_based_call, raw_event)
+  (provider_fetch_id, source_id, event_id, event_timestamp, event_timestamp_ms, cycle_start, cycle_end, page, model, kind, charged_cents, is_chargeable, is_headless, is_token_based_call, raw_event)
 VALUES
-  (:'provider_fetch_id', :'event_id', NULLIF(:'event_timestamp', '')::timestamptz, :'event_timestamp_ms', NULLIF(:'cycle_start', '')::timestamptz, NULLIF(:'cycle_end', '')::timestamptz, :'page', :'model', :'kind', NULLIF(:'charged_cents', '')::double precision, :'is_chargeable'::boolean, :'is_headless'::boolean, :'is_token_based_call'::boolean, convert_from(decode(:'raw_event_b64', 'base64'), 'UTF8')::jsonb)
-ON CONFLICT (event_id) DO NOTHING
+  (:'provider_fetch_id', :'source_id', :'event_id', NULLIF(:'event_timestamp', '')::timestamptz, :'event_timestamp_ms', NULLIF(:'cycle_start', '')::timestamptz, NULLIF(:'cycle_end', '')::timestamptz, :'page', :'model', :'kind', NULLIF(:'charged_cents', '')::double precision, :'is_chargeable'::boolean, :'is_headless'::boolean, :'is_token_based_call'::boolean, convert_from(decode(:'raw_event_b64', 'base64'), 'UTF8')::jsonb)
+ON CONFLICT (source_id, event_id) DO NOTHING
 RETURNING 1;
 """
         inserted = 0
@@ -2408,6 +2896,7 @@ RETURNING 1;
                     sql,
                     vars={
                         "provider_fetch_id": str(provider_fetch_id),
+                        "source_id": source_id,
                         "event_id": _cursor_usage_event_id(event),
                         "event_timestamp": event_timestamp,
                         "event_timestamp_ms": str(event_timestamp_ms),
@@ -2430,6 +2919,7 @@ RETURNING 1;
 
     def update_cursor_usage_sync_state(
         self,
+        source_id: str,
         cycle_start: str | None,
         cycle_end: str | None,
         synced_through_timestamp_ms: int,
@@ -2441,10 +2931,10 @@ RETURNING 1;
             return
         sql = """
 INSERT INTO cursor_usage_sync_state
-  (cycle_end, cycle_start, synced_through_timestamp_ms, total_usage_events_count, last_page_fetched, last_inserted_count, updated_at)
+  (source_id, cycle_end, cycle_start, synced_through_timestamp_ms, total_usage_events_count, last_page_fetched, last_inserted_count, updated_at)
 VALUES
-  (NULLIF(:'cycle_end', '')::timestamptz, NULLIF(:'cycle_start', '')::timestamptz, :'synced_through_timestamp_ms', :'total_usage_events_count', :'last_page_fetched', :'last_inserted_count', now())
-ON CONFLICT (cycle_end) DO UPDATE
+  (:'source_id', NULLIF(:'cycle_end', '')::timestamptz, NULLIF(:'cycle_start', '')::timestamptz, :'synced_through_timestamp_ms', :'total_usage_events_count', :'last_page_fetched', :'last_inserted_count', now())
+ON CONFLICT (source_id, cycle_end) DO UPDATE
 SET
   cycle_start = EXCLUDED.cycle_start,
   synced_through_timestamp_ms = LEAST(cursor_usage_sync_state.synced_through_timestamp_ms, EXCLUDED.synced_through_timestamp_ms),
@@ -2456,6 +2946,7 @@ SET
         self._run(
             sql,
             vars={
+                "source_id": source_id,
                 "cycle_end": cycle_end,
                 "cycle_start": _coalesce(cycle_start, ""),
                 "synced_through_timestamp_ms": str(synced_through_timestamp_ms),
@@ -2469,6 +2960,7 @@ SET
         self,
         cycle_end: str | None,
         model: str = "default",
+        source_id: str | None = None,
         account_id: str | None = None,
         organization_id: str | None = None,
         exclude_model: str | None = None,
@@ -2477,6 +2969,9 @@ SET
             return []
         scope_sql = ""
         vars = {"cycle_end": cycle_end, "model": model}
+        if source_id:
+            scope_sql += "\n      AND e.source_id = :'source_id'"
+            vars["source_id"] = source_id
         if account_id:
             scope_sql += "\n      AND f.account_id = :'account_id'"
             vars["account_id"] = account_id
@@ -2521,6 +3016,7 @@ __SCOPE_SQL__
         points = self.cursor_usage_cumulative_points(
             cycle_end=_coalesce(metric_row.get("window_end") or metric_row.get("reset_at")),
             model=str(details.get("graph_model") or "default"),
+            source_id=_coalesce(provider_row.get("source_id")),
             account_id=_coalesce(provider_row.get("account_id")),
             organization_id=_coalesce(provider_row.get("organization_id")),
         )
@@ -2556,6 +3052,7 @@ __SCOPE_SQL__
         days: int,
         window_start: str | None = None,
         window_end: str | None = None,
+        source_id: str | None = None,
         account_id: str | None = None,
         organization_id: str | None = None,
         use_value_num: bool = False,
@@ -2564,6 +3061,9 @@ __SCOPE_SQL__
         scope_sql = ""
         scope_vars: dict[str, str] = {}
         value_sql = "ROUND(COALESCE(m.value_num, 0))::bigint AS value" if use_value_num else "m.percent AS value"
+        if source_id:
+            scope_sql += "\n    AND f.source_id = :'source_id'"
+            scope_vars["source_id"] = source_id
         if account_id:
             scope_sql += "\n    AND f.account_id = :'account_id'"
             scope_vars["account_id"] = account_id
@@ -2649,13 +3149,25 @@ __SCOPE_SQL__
         sql = sql.replace("__SCOPE_SQL__", scope_sql).replace("__VALUE_SQL__", value_sql)
         return _parse_psql_json(self._run(sql, vars=vars))
 
-    def latest_raw(self, provider: str) -> dict[str, Any] | None:
+    def latest_raw(self, provider: str | None = None, source_id: str | None = None) -> dict[str, Any] | None:
+        if not provider and not source_id:
+            return None
+        vars: dict[str, str] = {}
+        filter_sql = ""
+        if source_id:
+            filter_sql += "\n    AND f.source_id = :'source_id'"
+            vars["source_id"] = source_id
+        if provider:
+            filter_sql += "\n    AND f.provider = :'provider'"
+            vars["provider"] = provider
         sql = """
 SELECT COALESCE(row_to_json(x), '{}'::json)
 FROM (
   SELECT
     f.id,
+    f.source_id,
     f.fetched_at,
+    f.provider,
     f.http_status,
     f.account_id,
     f.organization_id,
@@ -2663,31 +3175,61 @@ FROM (
     f.request_metadata,
     f.raw_payload
   FROM usage_provider_fetch f
-  WHERE f.provider = :'provider'
-    AND f.success = true
+  WHERE f.success = true
+__FILTER_SQL__
   ORDER BY f.fetched_at DESC
   LIMIT 1
         ) x;
 """
-        result = _parse_psql_json(self._run(sql, vars={"provider": provider}))
+        result = _parse_psql_json(self._run(sql.replace("__FILTER_SQL__", filter_sql), vars=vars))
         if isinstance(result, list):
             return result[0] if result else None
         if isinstance(result, dict):
             return result
         return None
 
-    def build_current_contract(self, history_days: int = 30) -> dict[str, Any]:
-        latest = {row["provider"]: row for row in self.latest_fetch()}
-        latest_attempts = {row["provider"]: row for row in self.latest_attempts()}
+    def build_current_contract(
+        self,
+        history_days: int = 30,
+        sources: tuple[SourceConfig, ...] | list[SourceConfig] | None = None,
+    ) -> dict[str, Any]:
+        visible_sources = [source for source in (sources or []) if source.enabled and source.frontend_visible]
+        visible_source_ids = [source.source_id for source in visible_sources]
+        source_config_by_id = {source.source_id: source for source in visible_sources}
+        if sources is not None and len(sources) > 0 and not visible_source_ids:
+            rows = []
+            attempts = []
+        else:
+            source_filter = visible_source_ids if visible_source_ids else None
+            rows = self.latest_fetch(source_ids=source_filter)
+            attempts = self.latest_attempts(source_ids=source_filter)
+        latest = {_coalesce(row.get("source_id"), row.get("provider")): row for row in rows}
+        latest_attempts = {_coalesce(row.get("source_id"), row.get("provider")): row for row in attempts}
         agents = []
         latest_updated_at: datetime | None = None
-        for provider in ("claude", "codex", "cursor"):
-            row = latest.get(provider)
+        row_order = visible_source_ids or [
+            _coalesce(row.get("source_id"), row.get("provider"))
+            for row in sorted(
+                rows,
+                key=lambda row: (
+                    SUPPORTED_PROVIDERS.index(str(row.get("provider"))) if str(row.get("provider")) in SUPPORTED_PROVIDERS else 99,
+                    str(row.get("source_id") or row.get("provider")),
+                ),
+            )
+        ]
+        for source_id in row_order:
+            row = latest.get(source_id)
             if not row:
                 continue
+            provider = _coalesce(row.get("provider"))
+            if provider not in SUPPORTED_PROVIDERS:
+                continue
+            source_config = source_config_by_id.get(source_id)
 
             metrics = self.latest_metrics(int(row["id"]))
             metadata = _safe_json(row.get("request_metadata"))
+            if not (source_config.frontend_visible if source_config else bool(metadata.get("frontend_visible", True))):
+                continue
             metric_map = {metric["metric_key"]: metric for metric in metrics}
             summary_key = metadata.get("summary_key") or (
                 "monthly" if provider == "cursor" else "seven_day" if provider == "claude" else "secondary_window"
@@ -2724,6 +3266,7 @@ FROM (
                             history_days,
                             window_start=_coalesce(metric.get("window_start")),
                             window_end=_coalesce(metric.get("window_end") or metric.get("reset_at")),
+                            source_id=source_id,
                             account_id=_coalesce(row.get("account_id")),
                             organization_id=_coalesce(row.get("organization_id")),
                             use_value_num=details.get("graph_value_kind") == "currency_cents",
@@ -2741,6 +3284,7 @@ FROM (
                 if monthly_metric and monthly_path:
                     non_auto_event_points = self.cursor_usage_cumulative_points(
                         cycle_end=_coalesce(monthly_metric.get("window_end") or monthly_metric.get("reset_at")),
+                        source_id=source_id,
                         account_id=_coalesce(row.get("account_id")),
                         organization_id=_coalesce(row.get("organization_id")),
                         exclude_model="default",
@@ -2752,6 +3296,7 @@ FROM (
                             history_days,
                             window_start=_coalesce(total_spend_metric.get("window_start")),
                             window_end=_coalesce(total_spend_metric.get("window_end") or total_spend_metric.get("reset_at")),
+                            source_id=source_id,
                             account_id=_coalesce(row.get("account_id")),
                             organization_id=_coalesce(row.get("organization_id")),
                             use_value_num=True,
@@ -2806,8 +3351,11 @@ FROM (
                 request_error=None,
                 request_metadata=metadata,
                 success=True,
+                source_id=source_id,
+                source_label=_coalesce(source_config.label if source_config else None, metadata.get("source_label"), source_id),
+                frontend_visible=source_config.frontend_visible if source_config else bool(metadata.get("frontend_visible", True)),
             )
-            provider_status = _provider_status(provider, row, latest_attempts.get(provider))
+            provider_status = _provider_status(provider, row, latest_attempts.get(source_id))
             agent = build_state_agent(
                 snapshot,
                 graph_points,
@@ -2831,14 +3379,18 @@ FROM (
             "agents": agents,
         }
 
-    def build_compat_state(self, history_days: int = 30) -> dict[str, Any]:
-        return self.build_current_contract(history_days=history_days)
+    def build_compat_state(
+        self,
+        history_days: int = 30,
+        sources: tuple[SourceConfig, ...] | list[SourceConfig] | None = None,
+    ) -> dict[str, Any]:
+        return self.build_current_contract(history_days=history_days, sources=sources)
 
-    def build_history_windows(self, provider: str, days: int) -> dict[str, Any]:
-        latest = {row["provider"]: row for row in self.latest_fetch()}
-        row = latest.get(provider)
+    def build_history_windows(self, provider: str, days: int, source_id: str | None = None) -> dict[str, Any]:
+        row = self.latest_provider_fetch(provider, source_id=source_id)
+        source_id = _coalesce(source_id, row.get("source_id") if row else None)
         if not row:
-            return {"provider": provider, "long_window": None, "short_window": None, "days": days}
+            return {"source_id": source_id, "provider": provider, "long_window": None, "short_window": None, "days": days}
 
         metrics = self.latest_metrics(int(row["id"]))
         long_metric = _pick_metric_by_candidates(metrics, provider, _graph_metric_candidates(provider, "long_window"))
@@ -2854,6 +3406,7 @@ FROM (
             elif provider == "cursor" and metric.get("metric_key") == "monthly":
                 non_auto_event_points = self.cursor_usage_cumulative_points(
                     cycle_end=_coalesce(metric.get("window_end") or metric.get("reset_at")),
+                    source_id=source_id,
                     account_id=_coalesce(row.get("account_id")),
                     organization_id=_coalesce(row.get("organization_id")),
                     exclude_model="default",
@@ -2869,6 +3422,7 @@ FROM (
                         days,
                         window_start=_coalesce(total_spend_metric.get("window_start")),
                         window_end=_coalesce(total_spend_metric.get("window_end") or total_spend_metric.get("reset_at")),
+                        source_id=source_id,
                         account_id=_coalesce(row.get("account_id")),
                         organization_id=_coalesce(row.get("organization_id")),
                         use_value_num=True,
@@ -2883,6 +3437,7 @@ FROM (
                         days,
                         window_start=_coalesce(over_cap_metric.get("window_start")),
                         window_end=_coalesce(over_cap_metric.get("window_end") or over_cap_metric.get("reset_at")),
+                        source_id=source_id,
                         account_id=_coalesce(row.get("account_id")),
                         organization_id=_coalesce(row.get("organization_id")),
                         use_value_num=True,
@@ -2897,6 +3452,7 @@ FROM (
                         days,
                         window_start=_coalesce(metric.get("window_start")),
                         window_end=_coalesce(metric.get("window_end") or metric.get("reset_at")),
+                        source_id=source_id,
                         account_id=_coalesce(row.get("account_id")),
                         organization_id=_coalesce(row.get("organization_id")),
                         use_value_num=False,
@@ -2917,6 +3473,7 @@ FROM (
                         days,
                         window_start=_coalesce(metric.get("window_start")),
                         window_end=_coalesce(metric.get("window_end") or metric.get("reset_at")),
+                        source_id=source_id,
                         account_id=_coalesce(row.get("account_id")),
                         organization_id=_coalesce(row.get("organization_id")),
                         use_value_num=details.get("graph_value_kind") == "currency_cents",
@@ -2927,17 +3484,20 @@ FROM (
             return _graph_from_metric(metric, points)
 
         return {
+            "source_id": source_id,
             "provider": provider,
             "days": days,
             "long_window": build_graph(long_metric),
             "short_window": build_graph(short_metric),
         }
 
-    def build_history(self, provider: str, metric: str, days: int) -> dict[str, Any]:
-        row = self.latest_provider_fetch(provider) or {}
+    def build_history(self, provider: str, metric: str, days: int, source_id: str | None = None) -> dict[str, Any]:
+        row = self.latest_provider_fetch(provider, source_id=source_id) or {}
+        source_id = _coalesce(source_id, row.get("source_id"))
         metric_row = self.latest_metric(
             provider,
             metric,
+            source_id=source_id,
             account_id=_coalesce(row.get("account_id")),
             organization_id=_coalesce(row.get("organization_id")),
         ) or {}
@@ -2948,6 +3508,7 @@ FROM (
         elif provider == "cursor" and metric_row.get("metric_key") == "monthly":
             non_auto_event_points = self.cursor_usage_cumulative_points(
                 cycle_end=_coalesce(metric_row.get("window_end") or metric_row.get("reset_at")),
+                source_id=source_id,
                 account_id=_coalesce(row.get("account_id")),
                 organization_id=_coalesce(row.get("organization_id")),
                 exclude_model="default",
@@ -2955,12 +3516,14 @@ FROM (
             total_spend_metric = self.latest_metric(
                 provider,
                 "total_spend",
+                source_id=source_id,
                 account_id=_coalesce(row.get("account_id")),
                 organization_id=_coalesce(row.get("organization_id")),
             ) or {}
             over_cap_metric = self.latest_metric(
                 provider,
                 "over_cap_used",
+                source_id=source_id,
                 account_id=_coalesce(row.get("account_id")),
                 organization_id=_coalesce(row.get("organization_id")),
             ) or {}
@@ -2973,6 +3536,7 @@ FROM (
                     days,
                     window_start=_coalesce(total_spend_metric.get("window_start")),
                     window_end=_coalesce(total_spend_metric.get("window_end") or total_spend_metric.get("reset_at")),
+                    source_id=source_id,
                     account_id=_coalesce(row.get("account_id")),
                     organization_id=_coalesce(row.get("organization_id")),
                     use_value_num=True,
@@ -2987,6 +3551,7 @@ FROM (
                     days,
                     window_start=_coalesce(over_cap_metric.get("window_start")),
                     window_end=_coalesce(over_cap_metric.get("window_end") or over_cap_metric.get("reset_at")),
+                    source_id=source_id,
                     account_id=_coalesce(row.get("account_id")),
                     organization_id=_coalesce(row.get("organization_id")),
                     use_value_num=True,
@@ -3001,6 +3566,7 @@ FROM (
                     days,
                     window_start=_coalesce(metric_row.get("window_start")),
                     window_end=_coalesce(metric_row.get("window_end") or metric_row.get("reset_at")),
+                    source_id=source_id,
                     account_id=_coalesce(row.get("account_id")),
                     organization_id=_coalesce(row.get("organization_id")),
                     use_value_num=False,
@@ -3021,6 +3587,7 @@ FROM (
                     days,
                     window_start=_coalesce(metric_row.get("window_start")),
                     window_end=_coalesce(metric_row.get("window_end") or metric_row.get("reset_at")),
+                    source_id=source_id,
                     account_id=_coalesce(row.get("account_id")),
                     organization_id=_coalesce(row.get("organization_id")),
                     use_value_num=details.get("graph_value_kind") == "currency_cents",
@@ -3030,6 +3597,7 @@ FROM (
             )
         graph = _graph_from_metric(metric_row, points)
         return {
+            "source_id": source_id,
             "provider": provider,
             "metric": metric_row.get("metric_key", metric),
             "metric_path": metric_path,

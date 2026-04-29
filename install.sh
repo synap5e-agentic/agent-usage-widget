@@ -7,6 +7,7 @@ PLUGIN_DIR="$HOME/.config/noctalia/plugins/$PLUGIN_ID"
 PLUGINS_JSON="$HOME/.config/noctalia/plugins.json"
 CONFIG_DIR="$HOME/.config/agent-usage-widget"
 ENV_FILE="$CONFIG_DIR/.env"
+CONFIG_FILE="$CONFIG_DIR/config.toml"
 RESTART_NOCTALIA=0
 
 find_noctalia_pids() {
@@ -39,10 +40,12 @@ echo "Installing agent-usage-widget..."
 
 mkdir -p "$HOME/bin" "$HOME/.config/systemd/user" "$CONFIG_DIR"
 
-if [ ! -f "$ENV_FILE" ]; then
-  cp "$SCRIPT_DIR/poller/.env.example" "$ENV_FILE"
-  chmod 600 "$ENV_FILE"
-  echo "Created $ENV_FILE from the sample template. Providers stay disabled until you opt in."
+if [ ! -f "$CONFIG_FILE" ] && [ ! -f "$ENV_FILE" ]; then
+  cp "$SCRIPT_DIR/poller/config.toml.example" "$CONFIG_FILE"
+  chmod 600 "$CONFIG_FILE"
+  echo "Created $CONFIG_FILE from the sample template. Fill in source auth and enable sources before polling."
+elif [ ! -f "$CONFIG_FILE" ]; then
+  echo "Leaving existing legacy $ENV_FILE in place. New installs should use $CONFIG_FILE."
 fi
 
 ln -sfv "$SCRIPT_DIR/poller/agent_usage_poll.py" "$HOME/bin/agent-usage-poll"

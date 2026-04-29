@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 import sys
@@ -18,6 +19,7 @@ from poller.agent_usage_common import (  # type: ignore  # noqa: E402
     AppConfig,
     PostgresClient,
     ProviderSnapshot,
+    SourceConfig,
     load_config,
     run_fetch,
     sync_cursor_usage_events,
@@ -27,6 +29,7 @@ from poller.agent_usage_common import (  # type: ignore  # noqa: E402
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config-file", default=None, help="Override AGENT_USAGE_CONFIG_FILE")
     parser.add_argument("--env-file", default=None, help="Override AGENT_USAGE_ENV_FILE")
     parser.add_argument(
         "--print-state",
@@ -51,11 +54,24 @@ def parse_args() -> argparse.Namespace:
         default=[],
         help="Limit fetches to selected providers",
     )
+    parser.add_argument(
+        "--source",
+        action="append",
+        default=[],
+        help="Limit fetches to selected source ids from config.toml",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Poll selected sources even if their configured interval has not elapsed",
+    )
     return parser.parse_args()
 
 
 def _load_config(args: argparse.Namespace) -> AppConfig:
     overrides = {}
+    if args.config_file:
+        overrides["AGENT_USAGE_CONFIG_FILE"] = args.config_file
     if args.env_file:
         overrides["AGENT_USAGE_ENV_FILE"] = args.env_file
     if args.state_file:
@@ -63,21 +79,49 @@ def _load_config(args: argparse.Namespace) -> AppConfig:
     return load_config(overrides)
 
 
-def _should_run_provider(name: str, selected: list[str], cfg: AppConfig) -> bool:
-    if selected and name not in selected:
+def _parse_timestamp(raw: object) -> datetime | None:
+    if raw is None:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _source_is_due(source: SourceConfig, latest_attempt: dict[str, object] | None, force: bool) -> bool:
+    if force or source.interval_seconds <= 0:
+        return True
+    if not latest_attempt:
+        return True
+    fetched_at = _parse_timestamp(latest_attempt.get("fetched_at"))
+    if not fetched_at:
+        return True
+    elapsed_seconds = (datetime.now(timezone.utc) - fetched_at).total_seconds()
+    return elapsed_seconds >= source.interval_seconds
+
+
+def _should_run_source(
+    source: SourceConfig,
+    selected_providers: list[str],
+    selected_sources: list[str],
+    latest_attempt: dict[str, object] | None,
+    force: bool,
+) -> bool:
+    if selected_sources and source.source_id not in selected_sources:
         return False
-    if name == "claude":
-        return cfg.claude_enabled
-    if name == "codex":
-        return cfg.codex_enabled
-    if name == "cursor":
-        return cfg.cursor_enabled
-    return False
+    if selected_providers and source.provider not in selected_providers:
+        return False
+    if not source.enabled:
+        return False
+    return _source_is_due(source, latest_attempt, force)
 
 
 def _write_compat_state(cfg: AppConfig, client: PostgresClient, history_days: int, path: Path | None) -> None:
     path = path or cfg.state_path
-    contract = client.build_compat_state(history_days=history_days)
+    contract = client.build_compat_state(history_days=history_days, sources=cfg.sources)
     write_state_file(path, contract)
     print(f"[agent-usage-poll] wrote state file: {path}")
 
@@ -85,38 +129,50 @@ def _write_compat_state(cfg: AppConfig, client: PostgresClient, history_days: in
 def main() -> int:
     args = parse_args()
     cfg = _load_config(args)
-    providers = ("claude", "codex", "cursor")
-    selected = args.provider or list(providers)
+    selected_providers = args.provider or []
+    selected_sources = args.source or []
 
     client = PostgresClient(cfg.db_dsn)
     client.ping()
+    latest_attempts = {
+        row.get("source_id"): row
+        for row in client.latest_attempts(source_ids=[source.source_id for source in cfg.sources] or None)
+        if isinstance(row, dict)
+    }
 
     snapshots: list[ProviderSnapshot] = []
-    for provider in providers:
-        if not _should_run_provider(provider, selected, cfg):
+    for source in cfg.sources:
+        latest_attempt = latest_attempts.get(source.source_id)
+        matches_selection = (
+            (not selected_sources or source.source_id in selected_sources)
+            and (not selected_providers or source.provider in selected_providers)
+        )
+        if not _should_run_source(source, selected_providers, selected_sources, latest_attempt, args.force):
+            if source.enabled and matches_selection:
+                print(f"[agent-usage-poll] {source.source_id}: skipped; interval not due")
             continue
 
         try:
-            snapshot = run_fetch(cfg, provider)
+            snapshot = run_fetch(cfg, source.provider, source=source)
             fetch_id = client.persist_snapshot(snapshot)
-            if provider == "cursor" and snapshot.success:
+            if source.provider == "cursor" and snapshot.success:
                 sync_stats = sync_cursor_usage_events(cfg, client, fetch_id, snapshot)
                 print(
-                    "[agent-usage-poll] cursor usage-events:"
+                    f"[agent-usage-poll] {source.source_id} cursor usage-events:"
                     f" pages={sync_stats['pages_fetched']}"
                     f" inserted={sync_stats['inserted']}"
                     f" total={sync_stats['total_events']}"
                 )
             snapshots.append(snapshot)
             print(
-                f"[agent-usage-poll] {provider}: status={snapshot.request_status}, success={snapshot.success}, "
-                f"metrics={len(snapshot.metrics)}"
+                f"[agent-usage-poll] {source.source_id} ({source.provider}): "
+                f"status={snapshot.request_status}, success={snapshot.success}, metrics={len(snapshot.metrics)}"
             )
         except Exception as exc:
-            print(f"[agent-usage-poll] {provider}: error={exc}", file=sys.stderr)
+            print(f"[agent-usage-poll] {source.source_id} ({source.provider}): error={exc}", file=sys.stderr)
             continue
 
-    contract = client.build_compat_state(history_days=args.history_days)
+    contract = client.build_compat_state(history_days=args.history_days, sources=cfg.sources)
     if args.print_state:
         print(json.dumps(contract, indent=2, ensure_ascii=False))
     if not args.print_state:

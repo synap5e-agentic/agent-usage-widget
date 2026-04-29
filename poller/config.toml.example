@@ -1,0 +1,44 @@
+[service]
+host = "127.0.0.1"
+port = 8785
+
+[poller]
+default_interval_seconds = 900
+
+[sources.personal]
+provider = "claude"
+label = "Claude Personal"
+frontend_visible = true
+enabled = false
+
+[sources.personal.auth]
+cookie = ""
+
+[sources.work]
+provider = "claude"
+label = "Claude Work"
+frontend_visible = true
+enabled = false
+interval_seconds = 1800
+
+[sources.work.auth]
+cookie = ""
+
+[sources.codex]
+provider = "codex"
+label = "Codex"
+frontend_visible = true
+enabled = false
+
+[sources.codex.auth]
+authorization = ""
+cookie = ""
+
+[sources.cursor]
+provider = "cursor"
+label = "Cursor"
+frontend_visible = true
+enabled = false
+
+[sources.cursor.auth]
+cookie = ""

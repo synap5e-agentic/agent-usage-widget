@@ -4,6 +4,7 @@
 
 CREATE TABLE IF NOT EXISTS usage_provider_fetch (
   id BIGSERIAL PRIMARY KEY,
+  source_id TEXT NOT NULL DEFAULT '',
   provider TEXT NOT NULL CHECK (provider IN ('claude', 'codex', 'cursor')),
   account_id TEXT NOT NULL,
   organization_id TEXT NOT NULL,
@@ -19,6 +20,7 @@ CREATE TABLE IF NOT EXISTS usage_provider_fetch (
 CREATE TABLE IF NOT EXISTS usage_metric_snapshot (
   id BIGSERIAL PRIMARY KEY,
   provider_fetch_id BIGINT NOT NULL REFERENCES usage_provider_fetch (id) ON DELETE CASCADE,
+  source_id TEXT NOT NULL DEFAULT '',
   provider TEXT NOT NULL CHECK (provider IN ('claude', 'codex', 'cursor')),
   metric_key TEXT NOT NULL,
   provider_metric_key TEXT NOT NULL DEFAULT '',
@@ -37,6 +39,18 @@ CREATE TABLE IF NOT EXISTS usage_metric_snapshot (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+ALTER TABLE usage_provider_fetch
+  ADD COLUMN IF NOT EXISTS source_id TEXT;
+UPDATE usage_provider_fetch
+SET source_id = provider
+WHERE source_id IS NULL OR source_id = '';
+ALTER TABLE usage_provider_fetch
+  ALTER COLUMN source_id SET DEFAULT '';
+ALTER TABLE usage_provider_fetch
+  ALTER COLUMN source_id SET NOT NULL;
+
+ALTER TABLE usage_metric_snapshot
+  ADD COLUMN IF NOT EXISTS source_id TEXT;
 ALTER TABLE usage_metric_snapshot
   ADD COLUMN IF NOT EXISTS provider_metric_key TEXT NOT NULL DEFAULT '';
 ALTER TABLE usage_metric_snapshot
@@ -58,6 +72,17 @@ UPDATE usage_metric_snapshot
 SET provider_metric_key = metric_key
 WHERE provider_metric_key IS NULL OR provider_metric_key = '';
 
+UPDATE usage_metric_snapshot m
+SET source_id = f.source_id
+FROM usage_provider_fetch f
+WHERE m.provider_fetch_id = f.id
+  AND (m.source_id IS NULL OR m.source_id = '');
+
+ALTER TABLE usage_metric_snapshot
+  ALTER COLUMN source_id SET DEFAULT '';
+ALTER TABLE usage_metric_snapshot
+  ALTER COLUMN source_id SET NOT NULL;
+
 ALTER TABLE usage_metric_snapshot
   ALTER COLUMN metric_path SET NOT NULL;
 
@@ -68,15 +93,22 @@ CREATE UNIQUE INDEX IF NOT EXISTS usage_metric_snapshot_provider_fetch_metric_pa
 CREATE INDEX IF NOT EXISTS usage_provider_fetch_provider_fetched_at_idx
   ON usage_provider_fetch (provider, fetched_at DESC);
 
+CREATE INDEX IF NOT EXISTS usage_provider_fetch_source_fetched_at_idx
+  ON usage_provider_fetch (source_id, fetched_at DESC);
+
 CREATE INDEX IF NOT EXISTS usage_metric_snapshot_fetch_created_idx
   ON usage_metric_snapshot (provider_fetch_id);
 
 CREATE INDEX IF NOT EXISTS usage_metric_snapshot_provider_metric_key_idx
   ON usage_metric_snapshot (provider, metric_key, created_at DESC);
 
+CREATE INDEX IF NOT EXISTS usage_metric_snapshot_source_metric_key_idx
+  ON usage_metric_snapshot (source_id, metric_key, created_at DESC);
+
 CREATE TABLE IF NOT EXISTS cursor_usage_event (
   id BIGSERIAL PRIMARY KEY,
   provider_fetch_id BIGINT NOT NULL REFERENCES usage_provider_fetch (id) ON DELETE CASCADE,
+  source_id TEXT NOT NULL DEFAULT '',
   event_id TEXT NOT NULL,
   event_timestamp TIMESTAMPTZ NOT NULL,
   event_timestamp_ms BIGINT NOT NULL,
@@ -93,13 +125,30 @@ CREATE TABLE IF NOT EXISTS cursor_usage_event (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS cursor_usage_event_event_id_uq
-  ON cursor_usage_event (event_id);
+ALTER TABLE cursor_usage_event
+  ADD COLUMN IF NOT EXISTS source_id TEXT;
+UPDATE cursor_usage_event e
+SET source_id = f.source_id
+FROM usage_provider_fetch f
+WHERE e.provider_fetch_id = f.id
+  AND (e.source_id IS NULL OR e.source_id = '');
+ALTER TABLE cursor_usage_event
+  ALTER COLUMN source_id SET DEFAULT '';
+ALTER TABLE cursor_usage_event
+  ALTER COLUMN source_id SET NOT NULL;
+
+DROP INDEX IF EXISTS cursor_usage_event_event_id_uq;
+CREATE UNIQUE INDEX IF NOT EXISTS cursor_usage_event_source_event_id_uq
+  ON cursor_usage_event (source_id, event_id);
 
 CREATE INDEX IF NOT EXISTS cursor_usage_event_cycle_ts_idx
   ON cursor_usage_event (cycle_end, event_timestamp_ms DESC);
 
+CREATE INDEX IF NOT EXISTS cursor_usage_event_source_cycle_ts_idx
+  ON cursor_usage_event (source_id, cycle_end, event_timestamp_ms DESC);
+
 CREATE TABLE IF NOT EXISTS cursor_usage_sync_state (
+  source_id TEXT NOT NULL DEFAULT '',
   cycle_end TIMESTAMPTZ PRIMARY KEY,
   cycle_start TIMESTAMPTZ,
   synced_through_timestamp_ms BIGINT NOT NULL DEFAULT 0,
@@ -108,3 +157,27 @@ CREATE TABLE IF NOT EXISTS cursor_usage_sync_state (
   last_inserted_count INTEGER NOT NULL DEFAULT 0,
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+ALTER TABLE cursor_usage_sync_state
+  ADD COLUMN IF NOT EXISTS source_id TEXT;
+UPDATE cursor_usage_sync_state
+SET source_id = 'cursor'
+WHERE source_id IS NULL OR source_id = '';
+ALTER TABLE cursor_usage_sync_state
+  ALTER COLUMN source_id SET DEFAULT '';
+ALTER TABLE cursor_usage_sync_state
+  ALTER COLUMN source_id SET NOT NULL;
+ALTER TABLE cursor_usage_sync_state
+  DROP CONSTRAINT IF EXISTS cursor_usage_sync_state_pkey;
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_constraint
+    WHERE conrelid = 'cursor_usage_sync_state'::regclass
+      AND contype = 'p'
+  ) THEN
+    ALTER TABLE cursor_usage_sync_state
+      ADD CONSTRAINT cursor_usage_sync_state_pkey PRIMARY KEY (source_id, cycle_end);
+  END IF;
+END $$;

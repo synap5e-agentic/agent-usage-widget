@@ -10,8 +10,11 @@ Item {
   property var agents: []
   property var backend: ({})
   property var configValues: ({})
+  property var envConfigValues: ({})
+  property var tomlConfigValues: ({})
   property string updatedAt: ""
   property string _envConfigStatus: ""
+  property string _tomlConfigStatus: ""
   property string _rejectedServiceHost: ""
   property real currentTime: Date.now()
   property bool serviceAvailable: false
@@ -19,6 +22,7 @@ Item {
 
   readonly property string homeDir: (Quickshell.env("HOME") || "")
   readonly property string defaultCacheDir: homeDir + "/.cache/agent-usage"
+  readonly property string configFilePath: expandHome(Quickshell.env("AGENT_USAGE_CONFIG_FILE") || (homeDir + "/.config/agent-usage-widget/config.toml"))
   readonly property string envFilePath: expandHome(Quickshell.env("AGENT_USAGE_ENV_FILE") || (homeDir + "/.config/agent-usage-widget/.env"))
   readonly property string cacheDir: expandHome(runtimeConfigValue("AGENT_USAGE_CACHE_DIR", defaultCacheDir))
   readonly property string stateFilePath: expandHome(runtimeConfigValue("AGENT_USAGE_STATE_FILE", cacheDir + "/state.json"))
@@ -63,6 +67,10 @@ Item {
   function runtimeConfigValue(name, fallback) {
     const envValue = String(Quickshell.env(name) || "").trim();
     if (envValue) return envValue;
+    const tomlValue = root.tomlConfigValues ? root.tomlConfigValues[name] : undefined;
+    if (tomlValue !== undefined && tomlValue !== null && String(tomlValue).trim()) return String(tomlValue).trim();
+    const envFileValue = root.envConfigValues ? root.envConfigValues[name] : undefined;
+    if (envFileValue !== undefined && envFileValue !== null && String(envFileValue).trim()) return String(envFileValue).trim();
     return configValue(name, fallback);
   }
 
@@ -103,8 +111,67 @@ Item {
     return parsed;
   }
 
+  function stripTomlComment(line) {
+    let inString = false;
+    let quote = "";
+    for (let i = 0; i < line.length; i++) {
+      const ch = line.charAt(i);
+      if ((ch === "\"" || ch === "'") && (i === 0 || line.charAt(i - 1) !== "\\")) {
+        if (!inString) {
+          inString = true;
+          quote = ch;
+        } else if (quote === ch) {
+          inString = false;
+          quote = "";
+        }
+      }
+      if (ch === "#" && !inString) return line.slice(0, i);
+    }
+    return line;
+  }
+
+  function parseTomlRuntimeText(rawText) {
+    const parsed = {};
+    const lines = String(rawText || "").split(/\r?\n/);
+    let section = "";
+    for (let i = 0; i < lines.length; i++) {
+      let line = stripTomlComment(lines[i]).trim();
+      if (!line) continue;
+      if (line.charAt(0) === "[" && line.charAt(line.length - 1) === "]") {
+        section = line.slice(1, -1).trim();
+        continue;
+      }
+      const eq = line.indexOf("=");
+      if (eq === -1) continue;
+      const key = line.slice(0, eq).trim();
+      let value = line.slice(eq + 1).trim();
+      if (
+        value.length >= 2 &&
+        ((value.charAt(0) === "\"" && value.charAt(value.length - 1) === "\"") ||
+         (value.charAt(0) === "'" && value.charAt(value.length - 1) === "'"))
+      ) {
+        value = value.slice(1, -1);
+      }
+      if (section === "service" && key === "host") parsed.AGENT_USAGE_SERVICE_HOST = value;
+      if (section === "service" && key === "port") parsed.AGENT_USAGE_SERVICE_PORT = value;
+      if ((section === "storage" || section === "poller") && key === "cache_dir") parsed.AGENT_USAGE_CACHE_DIR = value;
+      if ((section === "storage" || section === "poller") && key === "state_file") parsed.AGENT_USAGE_STATE_FILE = value;
+    }
+    return parsed;
+  }
+
   function applyEnvConfig(rawText) {
-    root.configValues = parseEnvText(rawText);
+    root.envConfigValues = parseEnvText(rawText);
+    root.configValues = root.envConfigValues;
+    validateRuntimeConfig();
+  }
+
+  function applyTomlConfig(rawText) {
+    root.tomlConfigValues = parseTomlRuntimeText(rawText);
+    validateRuntimeConfig();
+  }
+
+  function validateRuntimeConfig() {
     const configuredHost = runtimeConfigValue("AGENT_USAGE_SERVICE_HOST", "127.0.0.1");
     if (configuredHost && !isLocalHost(configuredHost)) {
       if (root._rejectedServiceHost !== configuredHost) {
@@ -179,7 +246,29 @@ Item {
     repeat: true
     onTriggered: {
       root.currentTime = Date.now();
+      configTomlFile.reload();
       envConfigFile.reload();
+    }
+  }
+
+  FileView {
+    id: configTomlFile
+    path: root.configFilePath
+
+    onLoaded: {
+      root._tomlConfigStatus = "loaded";
+      root.applyTomlConfig(root.readFileText(configTomlFile));
+      root.refreshFromConfiguredSources();
+    }
+
+    onLoadFailed: function(error) {
+      if (root._tomlConfigStatus !== "missing") {
+        Logger.i("AgentUsage", "config.toml not found, using env/default runtime config: " + error);
+      }
+      root._tomlConfigStatus = "missing";
+      root.tomlConfigValues = ({});
+      root.validateRuntimeConfig();
+      root.refreshFromConfiguredSources();
     }
   }
 
@@ -236,6 +325,7 @@ Item {
 
   Component.onCompleted: {
     Logger.i("AgentUsage", "Plugin initialized");
+    configTomlFile.reload();
     envConfigFile.reload();
   }
 }
