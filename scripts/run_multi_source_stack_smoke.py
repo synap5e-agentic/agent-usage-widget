@@ -144,6 +144,7 @@ def _seed_snapshot(
     history_label: str,
     plan: str,
     metrics: list[dict[str, Any]],
+    raw_payload: dict[str, Any] | None = None,
 ) -> int:
     snapshot = ProviderSnapshot(
         provider=provider,
@@ -154,7 +155,7 @@ def _seed_snapshot(
         history_key=history_key,
         history_label=history_label,
         details=[],
-        raw_payload={"source_id": source_id, "provider": provider},
+        raw_payload=raw_payload or {"source_id": source_id, "provider": provider},
         request_url=f"fixture://{source_id}",
         request_status=200,
         request_error=None,
@@ -194,9 +195,16 @@ def _seed_fixture_data(client: PostgresClient) -> None:
         f"Resets at {five_hour_end.astimezone().strftime('%Y-%m-%d %H:%M')}"
     )
 
-    def seed_claude(source_id: str, label: str, account_suffix: str, weekly: list[int], five_hour: list[int]) -> None:
+    def seed_claude(
+        source_id: str,
+        label: str,
+        account_suffix: str,
+        weekly: list[int],
+        five_hour: list[int],
+        extra_usage: list[float],
+    ) -> None:
         for idx, (week_pct, short_pct) in enumerate(zip(weekly, five_hour, strict=True)):
-            fetched_at = _iso(now - timedelta(hours=(len(weekly) - idx) * 2))
+            fetched_at = _iso(now - timedelta(minutes=[90, 45, 10][idx]))
             _seed_snapshot(
                 client,
                 source_id=source_id,
@@ -209,6 +217,17 @@ def _seed_fixture_data(client: PostgresClient) -> None:
                 history_key="seven_day",
                 history_label="This week",
                 plan="pro",
+                raw_payload={
+                    "source_id": source_id,
+                    "provider": "claude",
+                    "extra_usage": {
+                        "is_enabled": True,
+                        "monthly_limit": None,
+                        "used_credits": extra_usage[idx],
+                        "utilization": None,
+                        "currency": "USD",
+                    },
+                },
                 metrics=[
                     _metric(
                         metric_key="seven_day",
@@ -235,8 +254,8 @@ def _seed_fixture_data(client: PostgresClient) -> None:
                 ],
             )
 
-    seed_claude("personal", "Claude Personal", "personal", [8, 13, 21], [3, 5, 7])
-    seed_claude("work", "Claude Work", "work", [41, 53, 64], [12, 17, 22])
+    seed_claude("personal", "Claude Personal", "personal", [8, 13, 21], [3, 5, 7], [1500.0, 1500.0, 1917.0])
+    seed_claude("work", "Claude Work", "work", [41, 53, 64], [12, 17, 22], [250.0, 300.0, 300.0])
 
     hidden_fetch = _seed_snapshot(
         client,
@@ -326,8 +345,6 @@ WHERE id = :'fetch_id';
 
 
 def _write_config(path: Path, dbname: str, port: int) -> None:
-    cache_dir = path.parent / "cache"
-    state_file = cache_dir / "state.json"
     db_dsn = f"postgresql:///{dbname}?host={LOCAL_PG_SOCKET}&port={LOCAL_PG_PORT}"
     body = f"""
 [service]
@@ -337,9 +354,10 @@ port = {port}
 [poller]
 default_interval_seconds = 900
 
+[frontend]
+columns = 3
+
 [storage]
-cache_dir = "{cache_dir}"
-state_file = "{state_file}"
 db_dsn = "{db_dsn}"
 
 [sources.personal]
@@ -347,6 +365,14 @@ provider = "claude"
 label = "Claude Personal"
 frontend_visible = true
 enabled = true
+
+[sources.personal.frontend]
+order = 10
+short_label = "CP"
+show_metrics = ["seven_day", "five_hour", "extra_usage"]
+show_graphs = ["seven_day", "five_hour"]
+highlight_metric = "extra_usage"
+highlight_window_minutes = 34
 
 [sources.personal.auth]
 cookie = "fixture-personal"
@@ -357,6 +383,14 @@ label = "Claude Work"
 frontend_visible = true
 enabled = true
 interval_seconds = 1800
+
+[sources.work.frontend]
+order = 20
+short_label = "CW"
+show_metrics = ["seven_day", "five_hour", "extra_usage"]
+show_graphs = ["seven_day", "five_hour"]
+highlight_metric = "extra_usage"
+highlight_window_minutes = 34
 
 [sources.work.auth]
 cookie = "fixture-work"
@@ -375,6 +409,12 @@ provider = "codex"
 label = "Codex"
 frontend_visible = true
 enabled = true
+
+[sources.codex.frontend]
+order = 30
+short_label = "Cx"
+show_metrics = ["secondary_window", "primary_window"]
+show_graphs = ["secondary_window", "primary_window"]
 
 [sources.codex.auth]
 authorization = "Bearer fixture"
@@ -436,6 +476,16 @@ def _validate_service(base_url: str) -> dict[str, Any]:
     _assert(ids == ["personal", "work", "codex"], f"unexpected current ids: {ids}")
     _assert([item.get("provider") for item in items] == ["claude", "claude", "codex"], "unexpected provider ordering")
     _assert([item.get("label") for item in items] == ["Claude Personal", "Claude Work", "Codex"], "unexpected labels")
+    _assert((current.get("frontend") or {}).get("columns") == 3, "frontend columns should come from config")
+
+    personal = items[0]
+    personal_metrics = {metric.get("metric_key"): metric for metric in personal.get("metrics", [])}
+    _assert(personal.get("short_label") == "CP", "short label should come from frontend policy")
+    _assert((personal.get("frontend") or {}).get("show_metrics") == ["seven_day", "five_hour", "extra_usage"], "show_metrics should be policy-driven")
+    _assert("extra_usage" in personal_metrics, "Claude extra usage should be backfilled from raw payload")
+    _assert(personal_metrics["extra_usage"].get("value") == "$19.17", "extra usage should be rendered as money")
+    _assert((personal_metrics["extra_usage"].get("frontend") or {}).get("highlight_active") is True, "extra usage metric should carry active highlight")
+    _assert((personal.get("highlight") or {}).get("active") is True, "personal should highlight recent extra usage increases")
 
     personal_hist = _http_json(f"{base_url}/api/history?source=personal&metric=/seven_day&days=30")
     work_hist = _http_json(f"{base_url}/api/history?source=work&metric=/seven_day&days=30")
@@ -460,8 +510,6 @@ def _render_artifacts(base_url: str, artifact_dir: Path) -> tuple[Path, Path]:
         str(ROOT / "scripts" / "render_widget_screenshots.py"),
         "--service-url",
         f"{base_url}/api/current",
-        "--state-file",
-        str(artifact_dir / "missing-state.json"),
         "--panel-output",
         str(panel),
         "--bar-output",

@@ -13,14 +13,14 @@ TestCase {
     return panel;
   }
 
-  function test_orders_known_agents_before_unknown_agents() {
+  function test_orders_agents_by_frontend_policy() {
     const panel = createPanel();
 
     const ordered = panel.orderAgents([
-      { id: "work", provider: "cursor", label: "Cursor" },
+      { id: "work", label: "Cursor", frontend: { order: 30 } },
       { id: "other", label: "Other" },
-      { id: "personal", provider: "claude", label: "Claude" },
-      { id: "codex", provider: "codex", label: "Codex" },
+      { id: "personal", label: "Claude", frontend: { order: 10 } },
+      { id: "codex", label: "Codex", frontend: { order: 20 } },
     ]);
 
     compare(ordered.map(function(agent) { return agent.id; }).join(","), "personal,codex,work,other");
@@ -46,20 +46,20 @@ TestCase {
     panel.destroy();
   }
 
-  function test_filters_noise_metrics_and_keeps_graph_metrics_primary() {
+  function test_metric_sections_follow_frontend_policy() {
     const panel = createPanel();
     const cursor = {
       id: "cursor",
-      provider: "cursor",
+      frontend: { graph_order: ["long_window", "short_window"] },
       graphs: {
         long_window: { metric_path: "/monthly" },
         short_window: { metric_path: "/auto" },
       },
       metrics: [
-        { metric_key: "monthly", metric_path: "/monthly", label: "Monthly" },
-        { metric_key: "auto_spend", metric_path: "/auto", label: "Auto" },
-        { metric_key: "api_usage", metric_path: "/api", label: "API" },
-        { metric_key: "over_cap_used", metric_path: "/over", label: "Over cap" },
+        { metric_key: "monthly", metric_path: "/monthly", label: "Monthly", frontend: { visible: true, section: "primary" } },
+        { metric_key: "auto_spend", metric_path: "/auto", label: "Auto", frontend: { visible: true, section: "primary" } },
+        { metric_key: "api_usage", metric_path: "/api", label: "API", frontend: { visible: false, section: "secondary" } },
+        { metric_key: "over_cap_used", metric_path: "/over", label: "Over cap", frontend: { visible: true, section: "secondary" } },
       ],
     };
 
@@ -71,7 +71,7 @@ TestCase {
     compare(primary[1].metric_key, "auto_spend");
     compare(secondary.length, 1);
     compare(secondary[0].metric_key, "over_cap_used");
-    verify(!panel.shouldShowMetric(cursor, { metric_key: "api_usage" }));
+    verify(!panel.shouldShowMetric(cursor, cursor.metrics[2]));
 
     panel.destroy();
   }

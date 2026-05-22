@@ -23,13 +23,28 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 DEFAULT_CONFIG_FILE = Path.home() / ".config" / "agent-usage-widget" / "config.toml"
 DEFAULT_ENV_FILE = Path.home() / ".config" / "agent-usage-widget" / ".env"
-DEFAULT_CACHE_DIR = Path.home() / ".cache" / "agent-usage"
-DEFAULT_STATE_FILE = DEFAULT_CACHE_DIR / "state.json"
 DEFAULT_DB_DSN = "postgresql://agent_usage:agent_usage@127.0.0.1:5433/agent_usage"
 DEFAULT_SERVICE_HOST = "127.0.0.1"
 DEFAULT_SERVICE_PORT = 8785
 DEFAULT_POLL_INTERVAL_SECONDS = 60
 SUPPORTED_PROVIDERS = ("claude", "codex", "cursor")
+SCHEMA_LOCK_KEY = 934_771_251
+DEFAULT_HIGHLIGHT_WINDOW_MINUTES = 34
+
+
+@dataclass(frozen=True)
+class GlobalFrontendConfig:
+    columns: int | None = None
+
+
+@dataclass(frozen=True)
+class SourceFrontendConfig:
+    order: int | None = None
+    short_label: str = ""
+    show_metrics: tuple[str, ...] = ()
+    show_graphs: tuple[str, ...] = ()
+    highlight_metric: str = ""
+    highlight_window_minutes: int = DEFAULT_HIGHLIGHT_WINDOW_MINUTES
 
 
 @dataclass(frozen=True)
@@ -41,14 +56,13 @@ class SourceConfig:
     enabled: bool = True
     interval_seconds: int = DEFAULT_POLL_INTERVAL_SECONDS
     auth: dict[str, str] = field(default_factory=dict)
+    frontend: SourceFrontendConfig = field(default_factory=SourceFrontendConfig)
 
 
 @dataclass(frozen=True)
 class AppConfig:
     config_file: Path
     env_file: Path
-    cache_dir: Path
-    state_path: Path
     db_dsn: str
     service_host: str
     service_port: int
@@ -72,6 +86,7 @@ class AppConfig:
     codex_oai_session_id: str | None = None
     poller_default_interval_seconds: int = DEFAULT_POLL_INTERVAL_SECONDS
     sources: tuple[SourceConfig, ...] = ()
+    frontend: GlobalFrontendConfig = field(default_factory=GlobalFrontendConfig)
 
 
 @dataclass
@@ -159,6 +174,15 @@ def _int_value(value: Any, default: int) -> int:
     return parsed if parsed > 0 else default
 
 
+def _optional_int_value(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _coalesce(*values: str | None) -> str:
     for value in values:
         if value is None:
@@ -199,6 +223,25 @@ def _string_map(raw: Any) -> dict[str, str]:
 
 def _toml_table(raw: Any) -> dict[str, Any]:
     return raw if isinstance(raw, dict) else {}
+
+
+def _toml_string_tuple(raw: Any) -> tuple[str, ...]:
+    if raw is None:
+        return ()
+    if isinstance(raw, str):
+        values = [raw]
+    elif isinstance(raw, (list, tuple)):
+        values = list(raw)
+    else:
+        return ()
+    cleaned: list[str] = []
+    for value in values:
+        if value is None:
+            continue
+        text = _coalesce(str(value))
+        if text:
+            cleaned.append(text)
+    return tuple(cleaned)
 
 
 def _source_auth_value(source: SourceConfig | None, *keys: str) -> str:
@@ -385,12 +428,24 @@ def _metric_value_text(raw: dict[str, Any], percent: int) -> str:
     return f"{percent}%"
 
 
-def _format_money_cents(value: Any) -> str:
+def _currency_prefix(currency: str) -> str:
+    code = str(currency or "USD").strip().upper()
+    return {
+        "USD": "$",
+        "AUD": "A$",
+        "CAD": "C$",
+        "EUR": "EUR ",
+        "GBP": "GBP ",
+        "NZD": "NZ$",
+    }.get(code, f"{code} ")
+
+
+def _format_money_cents(value: Any, currency: str = "USD") -> str:
     try:
         cents = float(value)
     except (TypeError, ValueError):
         return str(value)
-    return f"${cents / 100.0:.2f}"
+    return f"{_currency_prefix(currency)}{cents / 100.0:.2f}"
 
 
 def _currency_graph_max(value: Any) -> int:
@@ -595,6 +650,8 @@ def _derive_window_bounds(
     metric_key: str,
     provider_metric_key: str,
     raw: dict[str, Any],
+    fetched_at: str = "",
+    percent: int | None = None,
 ) -> tuple[str, str]:
     start = _window_ts(raw, ("window_start", "start", "period_start", "starts_at"))
     end = _window_ts(raw, ("window_end", "end", "period_end", "ends_at"))
@@ -612,6 +669,11 @@ def _derive_window_bounds(
         start_dt = _parse_timestamp(start)
         if start_dt:
             end = (start_dt + timedelta(seconds=duration)).astimezone(timezone.utc).isoformat()
+    if not start and not end and duration and fetched_at and percent == 0:
+        fetched_dt = _parse_timestamp(fetched_at)
+        if fetched_dt:
+            start = fetched_dt.astimezone(timezone.utc).isoformat()
+            end = (fetched_dt + timedelta(seconds=duration)).astimezone(timezone.utc).isoformat()
     return start, end
 
 
@@ -644,7 +706,7 @@ def _looks_like_metric_payload(raw: dict[str, Any]) -> bool:
     return False
 
 
-def _collect_metric_rows(provider: str, payload: dict[str, Any]) -> list[dict[str, Any]]:
+def _collect_metric_rows(provider: str, payload: dict[str, Any], fetched_at: str = "") -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     seen_paths: set[str] = set()
 
@@ -663,7 +725,16 @@ def _collect_metric_rows(provider: str, payload: dict[str, Any]) -> list[dict[st
                     )
                     percent = _percent_from_usage_dict(node)
                     reset_at = _window_ts(node, ("resets_at", "reset_at", "reset_time", "until", "expires_at", "expires"))
-                    window_start, window_end = _derive_window_bounds(provider, metric_key, provider_metric_key, node)
+                    window_start, window_end = _derive_window_bounds(
+                        provider,
+                        metric_key,
+                        provider_metric_key,
+                        node,
+                        fetched_at=fetched_at,
+                        percent=percent,
+                    )
+                    if not reset_at:
+                        reset_at = window_end
                     value_num = None
                     for value_field in ("used", "value", "count", "remaining", "available"):
                         value = node.get(value_field)
@@ -711,6 +782,83 @@ def _collect_metric_rows(provider: str, payload: dict[str, Any]) -> list[dict[st
 
     walk(payload, [])
     return rows
+
+
+def _numeric_float(raw: Any) -> float | None:
+    if raw is None:
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(value):
+        return None
+    return value
+
+
+def _replace_metric_by_path(metrics: list[dict[str, Any]], replacement: dict[str, Any]) -> list[dict[str, Any]]:
+    replacement_path = str(replacement.get("metric_path") or "")
+    if not replacement_path:
+        return metrics + [replacement]
+    replaced = False
+    rows: list[dict[str, Any]] = []
+    for metric in metrics:
+        if str(metric.get("metric_path") or "") == replacement_path:
+            if not replaced:
+                rows.append(replacement)
+                replaced = True
+            continue
+        rows.append(metric)
+    if not replaced:
+        rows.append(replacement)
+    return rows
+
+
+def _claude_extra_usage_metric(payload: dict[str, Any]) -> dict[str, Any] | None:
+    extra_usage = _safe_json(payload.get("extra_usage"))
+    if not extra_usage:
+        return None
+    used_credits = _numeric_float(extra_usage.get("used_credits"))
+    if used_credits is None:
+        return None
+
+    currency = _coalesce(str(extra_usage.get("currency")) if extra_usage.get("currency") is not None else None, "USD").upper()
+    monthly_limit = _numeric_float(extra_usage.get("monthly_limit"))
+    max_value = _currency_graph_max(monthly_limit if monthly_limit and monthly_limit > 0 else used_credits)
+    note = f"Extra usage billed in {currency}"
+    if monthly_limit is None:
+        note += "\nNo monthly limit in payload"
+
+    return {
+        "metric_key": "extra_usage",
+        "provider_metric_key": "extra_usage",
+        "metric_path": "/extra_usage",
+        "metric_id": "/extra_usage",
+        "metric_scope": "/",
+        "metric_label": "Extra usage",
+        "percent": 0,
+        "value_num": used_credits,
+        "value": _format_money_cents(used_credits, currency),
+        "note": note,
+        "max_value": max_value,
+        "window_start": "",
+        "window_end": "",
+        "reset_at": "",
+        "details": {
+            "path": "/extra_usage",
+            "scope": "/",
+            "provider_metric_key": "extra_usage",
+            "metric_key": "extra_usage",
+            "payload_fragment": extra_usage,
+            "currency": currency,
+            "used_credits": used_credits,
+            "monthly_limit": monthly_limit,
+            "utilization": extra_usage.get("utilization"),
+            "graph_value_kind": "currency_cents",
+            "graph_pace_line": False,
+            "graph_max_value": max_value,
+        },
+    }
 
 
 def _pick_summary_key(provider: str, metrics: list[dict[str, Any]]) -> str:
@@ -832,6 +980,12 @@ def _sources_from_toml(config: dict[str, Any], default_interval_seconds: int) ->
                 f"expected one of: {', '.join(SUPPORTED_PROVIDERS)}"
             )
         interval_seconds = _int_value(source.get("interval_seconds"), default_interval_seconds)
+        frontend_table = _toml_table(source.get("frontend"))
+        frontend_order = _optional_int_value(frontend_table.get("order"))
+        highlight_window_minutes = _int_value(
+            frontend_table.get("highlight_window_minutes"),
+            DEFAULT_HIGHLIGHT_WINDOW_MINUTES,
+        )
         sources.append(
             SourceConfig(
                 source_id=source_id,
@@ -841,6 +995,14 @@ def _sources_from_toml(config: dict[str, Any], default_interval_seconds: int) ->
                 enabled=_toml_bool(source.get("enabled"), True),
                 interval_seconds=interval_seconds,
                 auth=_string_map(source.get("auth")),
+                frontend=SourceFrontendConfig(
+                    order=frontend_order,
+                    short_label=_coalesce(frontend_table.get("short_label")),
+                    show_metrics=_toml_string_tuple(frontend_table.get("show_metrics")),
+                    show_graphs=_toml_string_tuple(frontend_table.get("show_graphs")),
+                    highlight_metric=_coalesce(frontend_table.get("highlight_metric")),
+                    highlight_window_minutes=highlight_window_minutes,
+                ),
             )
         )
     return tuple(sources)
@@ -876,6 +1038,7 @@ def load_config(overrides: dict[str, str] | None = None) -> AppConfig:
     service_config = _toml_table(toml_config.get("service"))
     poller_config = _toml_table(toml_config.get("poller"))
     storage_config = _toml_table(toml_config.get("storage"))
+    frontend_config = _toml_table(toml_config.get("frontend"))
 
     default_interval_seconds = _int_value(
         explicit_values.get("AGENT_USAGE_POLL_INTERVAL_SECONDS"),
@@ -891,30 +1054,9 @@ def load_config(overrides: dict[str, str] | None = None) -> AppConfig:
     codex_source = _first_source_for_provider(sources, "codex")
     cursor_source = _first_source_for_provider(sources, "cursor")
 
-    cache_dir = Path(
-        _coalesce(
-            explicit_values.get("AGENT_USAGE_CACHE_DIR"),
-            storage_config.get("cache_dir"),
-            poller_config.get("cache_dir"),
-            values.get("AGENT_USAGE_CACHE_DIR"),
-            str(DEFAULT_CACHE_DIR),
-        )
-    ).expanduser()
-    state_path = Path(
-        _coalesce(
-            explicit_values.get("AGENT_USAGE_STATE_FILE"),
-            storage_config.get("state_file"),
-            poller_config.get("state_file"),
-            values.get("AGENT_USAGE_STATE_FILE"),
-            str(cache_dir / "state.json"),
-        )
-    ).expanduser()
-
     return AppConfig(
         config_file=config_file,
         env_file=env_file,
-        cache_dir=cache_dir,
-        state_path=state_path,
         db_dsn=_coalesce(
             explicit_values.get("AGENT_USAGE_DB_DSN"),
             storage_config.get("db_dsn"),
@@ -1017,6 +1159,9 @@ def load_config(overrides: dict[str, str] | None = None) -> AppConfig:
         ),
         poller_default_interval_seconds=default_interval_seconds,
         sources=sources,
+        frontend=GlobalFrontendConfig(
+            columns=_optional_int_value(frontend_config.get("columns")),
+        ),
     )
 
 
@@ -1257,7 +1402,10 @@ def normalize_claude(
     source: SourceConfig | None = None,
 ) -> ProviderSnapshot:
     data = _safe_json(payload)
-    metrics = _collect_metric_rows("claude", data)
+    metrics = _collect_metric_rows("claude", data, fetched_at=now_iso())
+    extra_usage_metric = _claude_extra_usage_metric(data)
+    if extra_usage_metric:
+        metrics = _replace_metric_by_path(metrics, extra_usage_metric)
     source_id = source.source_id if source else "claude"
     source_label = source.label if source else "Claude"
     organization_id = _claude_organization_id(cfg, fetch_url, source=source)
@@ -1365,7 +1513,7 @@ def normalize_codex(
     source: SourceConfig | None = None,
 ) -> ProviderSnapshot:
     data = _safe_json(payload)
-    metrics = _collect_metric_rows("codex", data)
+    metrics = _collect_metric_rows("codex", data, fetched_at=now_iso())
     source_id = source.source_id if source else "codex"
     source_label = source.label if source else "Codex"
     configured_account_id = _coalesce(_source_auth_value(source, "account_id"), cfg.codex_account_id)
@@ -1859,13 +2007,6 @@ def sync_cursor_usage_events(
     }
 
 
-def write_state_file(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    tmp.replace(path)
-
-
 def _build_history_label(provider: str) -> str:
     return "Last 7 days"
 
@@ -2129,12 +2270,8 @@ def _cursor_monthly_points_from_non_auto_events(
     event_points: list[dict[str, Any]],
 ) -> list[dict[str, int]]:
     limit_cents = _cursor_monthly_limit_cents(monthly_metric)
-    current_total_cents = _as_int(monthly_metric.get("value_num"))
     if limit_cents <= 0 or not event_points:
         return []
-
-    last_value = _as_int(event_points[-1].get("value"))
-    scale = (float(current_total_cents) / float(last_value)) if current_total_cents > 0 and last_value > 0 else 1.0
 
     points: list[dict[str, int]] = []
     for point in event_points:
@@ -2142,14 +2279,31 @@ def _cursor_monthly_points_from_non_auto_events(
         cents = _as_int(point.get("value"))
         if t <= 0:
             continue
-        scaled_cents = int(round(cents * scale))
         points.append(
             {
                 "t": t,
-                "value": _parse_unbounded_percentage((scaled_cents / limit_cents) * 100 if limit_cents else 0),
+                "value": _parse_unbounded_percentage((cents / limit_cents) * 100 if limit_cents else 0),
             }
         )
     return points
+
+
+def _cursor_adjust_monthly_metric_from_non_auto_events(
+    monthly_metric: dict[str, Any],
+    event_points: list[dict[str, Any]],
+) -> dict[str, Any]:
+    limit_cents = _cursor_monthly_limit_cents(monthly_metric)
+    if limit_cents <= 0 or not event_points:
+        return monthly_metric
+
+    adjusted_metric = dict(monthly_metric)
+    last_cents = max(0, _as_int(event_points[-1].get("value")))
+    percent = _parse_unbounded_percentage((last_cents / limit_cents) * 100 if limit_cents else 0)
+    adjusted_metric["value_num"] = last_cents
+    adjusted_metric["percent"] = percent
+    adjusted_metric["value"] = f"{percent}%"
+    adjusted_metric["max_value"] = _percent_graph_max(percent)
+    return adjusted_metric
 
 
 def _provider_status(
@@ -2204,27 +2358,203 @@ def _provider_status(
     return status
 
 
+def _provider_default_frontend(provider: str) -> dict[str, Any]:
+    if provider == "claude":
+        return {
+            "order": 0,
+            "short_label": "Cl",
+            "accent": "primary",
+            "show_metrics": ["seven_day", "five_hour", "extra_usage"],
+            "show_graphs": ["seven_day", "five_hour"],
+            "highlight_metric": "extra_usage",
+            "highlight_window_minutes": DEFAULT_HIGHLIGHT_WINDOW_MINUTES,
+        }
+    if provider == "codex":
+        return {
+            "order": 100,
+            "short_label": "Cx",
+            "accent": "tertiary",
+            "show_metrics": ["secondary_window", "primary_window"],
+            "show_graphs": ["secondary_window", "primary_window"],
+            "highlight_metric": "",
+            "highlight_window_minutes": DEFAULT_HIGHLIGHT_WINDOW_MINUTES,
+        }
+    if provider == "cursor":
+        return {
+            "order": 200,
+            "short_label": "Cu",
+            "accent": "primary",
+            "show_metrics": ["monthly", "auto_spend", "over_cap_used"],
+            "show_graphs": ["monthly", "auto_spend"],
+            "highlight_metric": "",
+            "highlight_window_minutes": DEFAULT_HIGHLIGHT_WINDOW_MINUTES,
+        }
+    return {
+        "order": 900,
+        "short_label": provider[:2].title(),
+        "accent": "primary",
+        "show_metrics": [],
+        "show_graphs": [],
+        "highlight_metric": "",
+        "highlight_window_minutes": DEFAULT_HIGHLIGHT_WINDOW_MINUTES,
+    }
+
+
+def _frontend_policy(
+    provider: str,
+    source: SourceConfig | None,
+    fallback_order_offset: int = 0,
+) -> dict[str, Any]:
+    defaults = _provider_default_frontend(provider)
+    frontend = source.frontend if source else SourceFrontendConfig()
+    order = frontend.order if frontend.order is not None else int(defaults["order"]) + fallback_order_offset
+    return {
+        "order": order,
+        "short_label": _coalesce(frontend.short_label, defaults.get("short_label")),
+        "accent": _coalesce(defaults.get("accent"), "primary"),
+        "show_metrics": list(frontend.show_metrics or tuple(defaults.get("show_metrics", []))),
+        "show_graphs": list(frontend.show_graphs or tuple(defaults.get("show_graphs", []))),
+        "highlight_metric": _coalesce(frontend.highlight_metric, defaults.get("highlight_metric")),
+        "highlight_window_minutes": frontend.highlight_window_minutes or int(defaults["highlight_window_minutes"]),
+    }
+
+
+def _metric_matches_selector(metric: dict[str, Any], selector: str, *, include_provider_metric_key: bool = False) -> bool:
+    candidate = str(selector or "").strip().lower()
+    if not candidate:
+        return False
+    fields = [
+        metric.get("metric_key"),
+        metric.get("metric_path"),
+        metric.get("metric_id"),
+    ]
+    if include_provider_metric_key:
+        fields.append(metric.get("provider_metric_key"))
+    for value in fields:
+        text = str(value or "").strip().lower()
+        if text == candidate:
+            return True
+        if not candidate.startswith("/") and text.endswith("/" + candidate):
+            return True
+    return False
+
+
+def _metric_selector_index(metric: dict[str, Any], selectors: list[str] | tuple[str, ...]) -> int | None:
+    for idx, selector in enumerate(selectors):
+        candidate = str(selector or "").strip().lower()
+        if not candidate:
+            continue
+        exact_fields = (
+            metric.get("metric_key"),
+            metric.get("metric_path"),
+            metric.get("metric_id"),
+        )
+        if any(str(value or "").strip().lower() == candidate for value in exact_fields):
+            return idx
+    return None
+
+
+def _metric_visible(metric: dict[str, Any], selectors: list[str] | tuple[str, ...]) -> bool:
+    return not selectors or _metric_selector_index(metric, selectors) is not None
+
+
+def _metric_accent(metric: dict[str, Any], provider: str) -> str:
+    key = str(metric.get("metric_key", "")).lower()
+    if key in {"five_hour", "primary_window", "spark_primary_window", "auto_spend"}:
+        return "secondary"
+    if key in {"secondary_window", "spark_usage", "spark"}:
+        return "tertiary"
+    return _coalesce(metric.get("accent"), _provider_default_frontend(provider).get("accent"), "primary")
+
+
+def _pick_metric_by_selector(metrics: list[dict[str, Any]], selector: str) -> dict[str, Any] | None:
+    candidate = str(selector or "").strip().lower()
+    matches = [metric for metric in metrics if _metric_matches_selector(metric, candidate, include_provider_metric_key=True)]
+    if not matches:
+        return None
+    def rank(metric: dict[str, Any]) -> tuple[int, str]:
+        exact_fields = (
+            metric.get("metric_key"),
+            metric.get("metric_path"),
+            metric.get("metric_id"),
+        )
+        for value in exact_fields:
+            if str(value or "").strip().lower() == candidate:
+                return (0, str(metric.get("metric_path", "")))
+        if str(metric.get("provider_metric_key") or "").strip().lower() == candidate:
+            return (1, str(metric.get("metric_path", "")))
+        return (2, str(metric.get("metric_path", "")))
+    return sorted(matches, key=rank)[0]
+
+
+def _pick_policy_graph_metrics(
+    metrics: list[dict[str, Any]],
+    provider: str,
+    selectors: list[str] | tuple[str, ...],
+) -> list[tuple[str, dict[str, Any]]]:
+    selected: list[tuple[str, dict[str, Any]]] = []
+    used_paths: set[str] = set()
+    graph_slot_names = ["long_window", "short_window"]
+    for idx, selector in enumerate(selectors):
+        selector_l = str(selector or "").lower()
+        graph_key = graph_slot_names[idx] if idx < len(graph_slot_names) else _slug_metric_key(selector_l)
+        if selector_l in {"long_window", "short_window"}:
+            metric = _pick_graph_metric(metrics, provider, selector_l)
+            graph_key = selector_l
+        else:
+            metric = _pick_metric_by_selector(metrics, selector)
+        if not metric:
+            continue
+        path = str(metric.get("metric_path") or metric.get("metric_key") or "")
+        if path in used_paths:
+            continue
+        used_paths.add(path)
+        selected.append((graph_key, metric))
+    return selected
+
+
 def build_state_agent(
     snapshot: ProviderSnapshot,
     graph_points: dict[str, list[dict[str, Any]]],
     provider_status: dict[str, Any] | None = None,
     updated_at: str = "",
+    frontend_policy: dict[str, Any] | None = None,
+    highlight: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    frontend_policy = dict(frontend_policy or _frontend_policy(snapshot.provider, None))
+    show_metrics = list(frontend_policy.get("show_metrics") or [])
+    show_graphs = list(frontend_policy.get("show_graphs") or [])
+    highlight = dict(highlight or {"active": False})
+
     summary_metric = snapshot.metrics[0]
     for metric in snapshot.metrics:
         if metric["metric_key"] == snapshot.summary_key:
             summary_metric = metric
             break
 
-    if snapshot.provider == "cursor":
-        order = ["monthly", "auto_spend", "over_cap_used", "api_usage", "auto_usage", "included_spend", "total_spend", "provider_total_usage"]
-    elif snapshot.provider == "claude":
-        order = ["seven_day", "five_hour"]
-    else:
-        order = ["secondary_window", "primary_window"]
-    order_index = {key: idx for idx, key in enumerate(order)}
+    selected_graphs = _pick_policy_graph_metrics(snapshot.metrics, snapshot.provider, show_graphs)
+    graph_metric_ids = {
+        str(metric.get("metric_path") or metric.get("metric_key") or "")
+        for _graph_key, metric in selected_graphs
+    }
+
+    def metric_sort_key(metric: dict[str, Any]) -> tuple[int, str]:
+        selector_idx = _metric_selector_index(metric, show_metrics)
+        if selector_idx is None:
+            selector_idx = len(show_metrics)
+        return selector_idx, str(metric.get("metric_label", ""))
+
     metric_rows = []
-    for metric in sorted(snapshot.metrics, key=lambda metric: (order_index.get(metric.get("metric_key", ""), len(order)), metric.get("metric_label", ""))):
+    for metric in sorted(snapshot.metrics, key=metric_sort_key):
+        metric_id = str(metric.get("metric_path") or metric.get("metric_key") or "")
+        visible = _metric_visible(metric, show_metrics)
+        is_graph_metric = metric_id in graph_metric_ids
+        is_highlight_metric = bool(frontend_policy.get("highlight_metric")) and _metric_matches_selector(
+            metric,
+            str(frontend_policy.get("highlight_metric") or ""),
+        )
+        details = _safe_json(metric.get("details"))
+        accent = _metric_accent(metric, snapshot.provider)
         metric_rows.append(
             {
                 "label": metric["metric_label"],
@@ -2234,33 +2564,40 @@ def build_state_agent(
                 "metric_id": metric.get("metric_id", metric.get("metric_path", "")),
                 "value": metric["value"],
                 "percent": int(metric["percent"]),
-                "accent": (
-                    "secondary"
-                    if metric["metric_key"]
-                    in {"primary_window", "five_hour", "session", "week", "auto_spend"}
-                    else ("primary" if snapshot.provider == "claude" else "tertiary" if snapshot.provider == "codex" else "primary")
-                ),
+                "accent": accent,
                 "note": metric.get("note", ""),
+                "value_kind": details.get("graph_value_kind", "percent"),
                 "show_bar": not (
-                    _safe_json(metric.get("details")).get("graph_value_kind") == "currency_cents"
+                    details.get("graph_value_kind") == "currency_cents"
                     or metric["metric_key"] in {"over_cap_used", "total_spend", "provider_total_usage"}
                 ),
+                "frontend": {
+                    "visible": visible,
+                    "section": "primary" if is_graph_metric else "secondary",
+                    "order": metric_sort_key(metric)[0],
+                    "highlight_metric": is_highlight_metric,
+                    "highlight_active": is_highlight_metric and bool(highlight.get("active")),
+                },
             }
         )
 
-    accent = "primary" if snapshot.provider in ("claude", "cursor") else "tertiary"
-    short_label = "Cl" if snapshot.provider == "claude" else "Cx" if snapshot.provider == "codex" else "Cu"
+    accent = str(frontend_policy.get("accent") or "primary")
+    short_label = str(frontend_policy.get("short_label") or snapshot.provider[:2].title())
     plan = snapshot.request_metadata.get("plan", "Pro")
     summary_label = "Monthly usage" if snapshot.provider == "cursor" else "Weekly usage"
     source_id = _coalesce(snapshot.source_id, snapshot.provider)
     label = _coalesce(snapshot.source_label, snapshot.request_metadata.get("source_label"), snapshot.provider.title())
-    long_metric = _pick_graph_metric(snapshot.metrics, snapshot.provider, "long_window")
-    short_metric = _pick_graph_metric(snapshot.metrics, snapshot.provider, "short_window")
     graphs: dict[str, Any] = {}
-    if long_metric:
-        graphs["long_window"] = _graph_from_metric(long_metric, graph_points.get(long_metric.get("metric_path") or long_metric.get("metric_key"), []))
-    if short_metric:
-        graphs["short_window"] = _graph_from_metric(short_metric, graph_points.get(short_metric.get("metric_path") or short_metric.get("metric_key"), []))
+    for graph_key, metric in selected_graphs:
+        metric_id = metric.get("metric_path") or metric.get("metric_key")
+        graph = _graph_from_metric(metric, graph_points.get(metric_id, []))
+        graph["accent"] = _metric_accent(metric, snapshot.provider)
+        graphs[graph_key] = graph
+    graph_order = list(graphs.keys())
+    history_graph = graphs.get(graph_order[0]) if graph_order else None
+    frontend_payload = dict(frontend_policy)
+    frontend_payload["graph_order"] = graph_order
+    frontend_payload["highlight"] = highlight
 
     return {
         "id": source_id,
@@ -2280,13 +2617,15 @@ def build_state_agent(
         },
         "graphs": graphs,
         "metrics": metric_rows,
+        "frontend": frontend_payload,
+        "highlight": highlight,
         "history": {
-            "label": (graphs.get("long_window") or {}).get("label", snapshot.history_label or _build_history_label(snapshot.provider)),
+            "label": (history_graph or {}).get("label", snapshot.history_label or _build_history_label(snapshot.provider)),
             "max_value": int(summary_metric.get("max_value", 100)),
-            "window_start": (graphs.get("long_window") or {}).get("window_start"),
-            "window_end": (graphs.get("long_window") or {}).get("window_end"),
-            "reset_at": (graphs.get("long_window") or {}).get("reset_at"),
-            "points": (graphs.get("long_window") or {}).get("points", []),
+            "window_start": (history_graph or {}).get("window_start"),
+            "window_end": (history_graph or {}).get("window_end"),
+            "reset_at": (history_graph or {}).get("reset_at"),
+            "points": (history_graph or {}).get("points", []),
         },
         "details": snapshot.details,
         "raw_provider_scope": {
@@ -2384,9 +2723,17 @@ class PostgresClient:
 
     def ensure_schema(self) -> None:
         try:
+            bootstrap_sql = "\n".join(
+                [
+                    f"SELECT pg_advisory_lock({SCHEMA_LOCK_KEY});",
+                    f"\\i {SCHEMA_SQL_PATH}",
+                    f"SELECT pg_advisory_unlock({SCHEMA_LOCK_KEY});",
+                ]
+            )
             result = subprocess.run(
-                self._psql_cmd() + ["-f", str(SCHEMA_SQL_PATH)],
+                self._psql_cmd(),
                 check=True,
+                input=bootstrap_sql,
                 capture_output=True,
                 text=True,
                 env=self._psql_env(),
@@ -2396,12 +2743,16 @@ class PostgresClient:
             stdout = (exc.stdout or "").strip()
             detail = stderr or stdout or str(exc)
             raise RuntimeError(f"psql schema bootstrap failed: {detail}") from exc
-        if result.stdout:
-            _parse_psql_json(result.stdout)
         migrated = self.migrate_legacy_cursor_scope()
         if migrated:
             print(
                 f"[agent-usage] migrated {migrated} legacy Cursor fetch rows to the scoped identity",
+                flush=True,
+            )
+        backfilled = self.backfill_claude_extra_usage_metrics()
+        if backfilled:
+            print(
+                f"[agent-usage] backfilled {backfilled} Claude extra usage metric rows",
                 flush=True,
             )
 
@@ -2470,6 +2821,118 @@ updated AS (
   RETURNING 1
 )
 SELECT COUNT(*) FROM updated;
+"""
+        result = _parse_psql_json(self._run(sql))
+        if isinstance(result, list):
+            return int(result[0] or 0) if result else 0
+        return int(result or 0)
+
+    def backfill_claude_extra_usage_metrics(self) -> int:
+        sql = r"""
+WITH candidates AS (
+  SELECT
+    f.id AS provider_fetch_id,
+    f.source_id,
+    f.provider,
+    f.raw_payload->'extra_usage' AS extra_usage,
+    UPPER(COALESCE(NULLIF(f.raw_payload #>> '{extra_usage,currency}', ''), 'USD')) AS currency,
+    (f.raw_payload #>> '{extra_usage,used_credits}')::double precision AS used_credits,
+    CASE
+      WHEN COALESCE(f.raw_payload #>> '{extra_usage,monthly_limit}', '') ~ '^-?[0-9]+(\.[0-9]+)?$'
+      THEN (f.raw_payload #>> '{extra_usage,monthly_limit}')::double precision
+      ELSE NULL
+    END AS monthly_limit
+  FROM usage_provider_fetch f
+  WHERE f.provider = 'claude'
+    AND f.success = true
+    AND jsonb_typeof(f.raw_payload->'extra_usage') = 'object'
+    AND COALESCE(f.raw_payload #>> '{extra_usage,used_credits}', '') ~ '^-?[0-9]+(\.[0-9]+)?$'
+),
+metric_rows AS (
+  SELECT
+    provider_fetch_id,
+    source_id,
+    provider,
+    currency,
+    used_credits,
+    monthly_limit,
+    GREATEST(
+      100,
+      (CEIL((GREATEST(used_credits, COALESCE(monthly_limit, 0)) * 1.05) / 100.0) * 100)::integer
+    ) AS max_value,
+    CASE
+      WHEN currency = 'USD'
+      THEN '$' || TO_CHAR((used_credits / 100.0)::numeric, 'FM999999990.00')
+      ELSE currency || ' ' || TO_CHAR((used_credits / 100.0)::numeric, 'FM999999990.00')
+    END AS value_text,
+    jsonb_build_object(
+      'path', '/extra_usage',
+      'scope', '/',
+      'provider_metric_key', 'extra_usage',
+      'metric_key', 'extra_usage',
+      'payload_fragment', extra_usage,
+      'currency', currency,
+      'used_credits', used_credits,
+      'monthly_limit', monthly_limit,
+      'utilization', extra_usage->'utilization',
+      'graph_value_kind', 'currency_cents',
+      'graph_pace_line', false,
+      'graph_max_value', GREATEST(
+        100,
+        (CEIL((GREATEST(used_credits, COALESCE(monthly_limit, 0)) * 1.05) / 100.0) * 100)::integer
+      )
+    ) AS details
+  FROM candidates
+),
+upserted AS (
+  INSERT INTO usage_metric_snapshot
+    (provider_fetch_id, source_id, provider, metric_key, provider_metric_key, metric_path, metric_scope, metric_label, percent, value_num, value_text, note, max_value, window_start, window_end, reset_at, details)
+  SELECT
+    provider_fetch_id,
+    source_id,
+    provider,
+    'extra_usage',
+    'extra_usage',
+    '/extra_usage',
+    '/',
+    'Extra usage',
+    0,
+    used_credits,
+    value_text,
+    'Extra usage billed in ' || currency || CASE WHEN monthly_limit IS NULL THEN E'\nNo monthly limit in payload' ELSE '' END,
+    max_value,
+    NULL,
+    NULL,
+    NULL,
+    details
+  FROM metric_rows
+  ON CONFLICT (provider_fetch_id, metric_path) DO UPDATE
+  SET
+    source_id = EXCLUDED.source_id,
+    provider = EXCLUDED.provider,
+    metric_key = EXCLUDED.metric_key,
+    provider_metric_key = EXCLUDED.provider_metric_key,
+    metric_scope = EXCLUDED.metric_scope,
+    metric_label = EXCLUDED.metric_label,
+    percent = EXCLUDED.percent,
+    value_num = EXCLUDED.value_num,
+    value_text = EXCLUDED.value_text,
+    note = EXCLUDED.note,
+    max_value = EXCLUDED.max_value,
+    details = EXCLUDED.details
+  WHERE usage_metric_snapshot.metric_key IS DISTINCT FROM EXCLUDED.metric_key
+     OR usage_metric_snapshot.provider_metric_key IS DISTINCT FROM EXCLUDED.provider_metric_key
+     OR usage_metric_snapshot.metric_scope IS DISTINCT FROM EXCLUDED.metric_scope
+     OR usage_metric_snapshot.metric_label IS DISTINCT FROM EXCLUDED.metric_label
+     OR usage_metric_snapshot.percent IS DISTINCT FROM EXCLUDED.percent
+     OR usage_metric_snapshot.value_num IS DISTINCT FROM EXCLUDED.value_num
+     OR usage_metric_snapshot.value_text IS DISTINCT FROM EXCLUDED.value_text
+     OR usage_metric_snapshot.note IS DISTINCT FROM EXCLUDED.note
+     OR usage_metric_snapshot.max_value IS DISTINCT FROM EXCLUDED.max_value
+     OR usage_metric_snapshot.details IS DISTINCT FROM EXCLUDED.details
+  RETURNING 1
+)
+SELECT COUNT(*) FROM upserted;
 """
         result = _parse_psql_json(self._run(sql))
         if isinstance(result, list):
@@ -2998,17 +3461,26 @@ SET
         sql = """
 SELECT COALESCE(json_agg(json_build_object('t', t, 'value', value) ORDER BY t), '[]'::json)
 FROM (
-  WITH raw AS (
+  WITH deduped AS (
     SELECT
-      date_trunc('hour', event_timestamp) AS bucket,
-      event_timestamp,
-      SUM(COALESCE(charged_cents, 0)) OVER (ORDER BY event_timestamp ASC, e.id ASC) AS cumulative_cents
+      e.event_timestamp_ms,
+      MAX(e.event_timestamp) AS event_timestamp,
+      COALESCE(e.model, '') AS model,
+      MAX(COALESCE(e.charged_cents, 0)) AS charged_cents
     FROM cursor_usage_event e
     JOIN usage_provider_fetch f ON f.id = e.provider_fetch_id
     WHERE e.cycle_end = NULLIF(:'cycle_end', '')::timestamptz
       AND e.is_chargeable = true
 __MODEL_SQL__
 __SCOPE_SQL__
+    GROUP BY e.event_timestamp_ms, COALESCE(e.model, '')
+  ),
+  raw AS (
+    SELECT
+      date_trunc('hour', event_timestamp) AS bucket,
+      event_timestamp,
+      SUM(charged_cents) OVER (ORDER BY event_timestamp ASC, event_timestamp_ms ASC, model ASC) AS cumulative_cents
+    FROM deduped
   )
   SELECT
     EXTRACT(EPOCH FROM MAX(event_timestamp))::bigint AS t,
@@ -3163,6 +3635,93 @@ __SCOPE_SQL__
         sql = sql.replace("__SCOPE_SQL__", scope_sql).replace("__VALUE_SQL__", value_sql)
         return _parse_psql_json(self._run(sql, vars=vars))
 
+    def metric_recent_increase(
+        self,
+        provider: str,
+        metric: str,
+        window_minutes: int,
+        source_id: str | None = None,
+        account_id: str | None = None,
+        organization_id: str | None = None,
+    ) -> dict[str, Any]:
+        scope_sql = ""
+        vars = {
+            "provider": provider,
+            "metric": metric,
+            "window_minutes": str(max(1, int(window_minutes or DEFAULT_HIGHLIGHT_WINDOW_MINUTES))),
+        }
+        if source_id:
+            scope_sql += "\n      AND f.source_id = :'source_id'"
+            vars["source_id"] = source_id
+        if account_id:
+            scope_sql += "\n      AND f.account_id = :'account_id'"
+            vars["account_id"] = account_id
+        if organization_id:
+            scope_sql += "\n      AND f.organization_id = :'organization_id'"
+            vars["organization_id"] = organization_id
+        sql = """
+SELECT COALESCE(row_to_json(result), '{}'::json)
+FROM (
+  WITH scoped AS (
+    SELECT
+      f.fetched_at,
+      COALESCE(m.value_num, m.percent::double precision) AS value
+    FROM usage_metric_snapshot m
+    JOIN usage_provider_fetch f ON f.id = m.provider_fetch_id
+    WHERE f.provider = :'provider'
+      AND f.success = true
+      AND (m.metric_path = :'metric' OR m.metric_key = :'metric' OR m.provider_metric_key = :'metric')
+__SCOPE_SQL__
+  ),
+  series AS (
+    SELECT * FROM scoped
+    WHERE fetched_at >= NOW() - (:'window_minutes'::int * INTERVAL '1 minute')
+    UNION ALL
+    SELECT * FROM (
+      SELECT * FROM scoped
+      WHERE fetched_at < NOW() - (:'window_minutes'::int * INTERVAL '1 minute')
+      ORDER BY fetched_at DESC
+      LIMIT 1
+    ) previous
+  ),
+  deltas AS (
+    SELECT
+      fetched_at,
+      value,
+      value - LAG(value) OVER (ORDER BY fetched_at ASC) AS delta
+    FROM series
+  ),
+  positive AS (
+    SELECT *
+    FROM deltas
+    WHERE fetched_at >= NOW() - (:'window_minutes'::int * INTERVAL '1 minute')
+      AND delta > 0
+    ORDER BY fetched_at DESC
+    LIMIT 1
+  ),
+  latest AS (
+    SELECT * FROM series ORDER BY fetched_at DESC LIMIT 1
+  )
+  SELECT
+    EXISTS(SELECT 1 FROM positive) AS active,
+    (SELECT EXTRACT(EPOCH FROM fetched_at)::bigint FROM positive) AS increased_at,
+    COALESCE((SELECT delta FROM positive), 0) AS delta,
+    COALESCE((SELECT value FROM latest), 0) AS current_value,
+    :'window_minutes'::int AS window_minutes
+) result;
+"""
+        result = _parse_psql_json(self._run(sql.replace("__SCOPE_SQL__", scope_sql), vars=vars))
+        if not isinstance(result, dict):
+            return {"active": False, "window_minutes": int(vars["window_minutes"])}
+        return {
+            "active": bool(result.get("active")),
+            "metric": metric,
+            "window_minutes": int(result.get("window_minutes") or vars["window_minutes"]),
+            "delta": float(result.get("delta") or 0),
+            "current_value": float(result.get("current_value") or 0),
+            "increased_at": int(result.get("increased_at") or 0),
+        }
+
     def latest_raw(self, provider: str | None = None, source_id: str | None = None) -> dict[str, Any] | None:
         if not provider and not source_id:
             return None
@@ -3206,8 +3765,17 @@ __FILTER_SQL__
         self,
         history_days: int = 30,
         sources: tuple[SourceConfig, ...] | list[SourceConfig] | None = None,
+        frontend: GlobalFrontendConfig | None = None,
     ) -> dict[str, Any]:
         visible_sources = [source for source in (sources or []) if source.enabled and source.frontend_visible]
+        source_index_by_id = {source.source_id: idx for idx, source in enumerate(visible_sources)}
+        visible_sources = sorted(
+            visible_sources,
+            key=lambda source: (
+                _frontend_policy(source.provider, source, source_index_by_id.get(source.source_id, 0)).get("order", 999),
+                source_index_by_id.get(source.source_id, 999),
+            ),
+        )
         visible_source_ids = [source.source_id for source in visible_sources]
         source_config_by_id = {source.source_id: source for source in visible_sources}
         if sources is not None and len(sources) > 0 and not visible_source_ids:
@@ -3239,6 +3807,11 @@ __FILTER_SQL__
             if provider not in SUPPORTED_PROVIDERS:
                 continue
             source_config = source_config_by_id.get(source_id)
+            frontend_policy = _frontend_policy(
+                provider,
+                source_config,
+                source_index_by_id.get(source_id, len(agents)),
+            )
 
             metrics = self.latest_metrics(int(row["id"]))
             metadata = _safe_json(row.get("request_metadata"))
@@ -3325,6 +3898,7 @@ __FILTER_SQL__
                         graph_points.get(over_cap_path, []),
                     )
                     if non_auto_event_points:
+                        adjusted_metric = _cursor_adjust_monthly_metric_from_non_auto_events(adjusted_metric, non_auto_event_points)
                         adjusted_points = _cursor_monthly_points_from_non_auto_events(adjusted_metric, non_auto_event_points)
                     elif total_spend_points:
                         adjusted_points = _cursor_monthly_points_from_total_spend(adjusted_metric, total_spend_points)
@@ -3370,11 +3944,42 @@ __FILTER_SQL__
                 frontend_visible=source_config.frontend_visible if source_config else bool(metadata.get("frontend_visible", True)),
             )
             provider_status = _provider_status(provider, row, latest_attempts.get(source_id))
+            highlight_metric = _coalesce(frontend_policy.get("highlight_metric"))
+            highlight = {
+                "active": False,
+                "metric": highlight_metric,
+                "window_minutes": int(frontend_policy.get("highlight_window_minutes") or DEFAULT_HIGHLIGHT_WINDOW_MINUTES),
+            }
+            if highlight_metric:
+                try:
+                    metric_for_highlight = _pick_metric_by_selector(snapshot.metrics, highlight_metric)
+                    metric_selector = _coalesce(
+                        metric_for_highlight.get("metric_path") if metric_for_highlight else None,
+                        highlight_metric,
+                    )
+                    highlight.update(
+                        self.metric_recent_increase(
+                            provider,
+                            metric_selector,
+                            int(frontend_policy.get("highlight_window_minutes") or DEFAULT_HIGHLIGHT_WINDOW_MINUTES),
+                            source_id=source_id,
+                            account_id=_coalesce(row.get("account_id")),
+                            organization_id=_coalesce(row.get("organization_id")),
+                        )
+                    )
+                    highlight["metric"] = highlight_metric
+                    highlight["metric_path"] = metric_selector
+                    if metric_for_highlight:
+                        highlight["value"] = metric_for_highlight.get("value")
+                except Exception:
+                    highlight["active"] = False
             agent = build_state_agent(
                 snapshot,
                 graph_points,
                 provider_status=provider_status,
                 updated_at=_timestamp_to_iso_utc(row.get("fetched_at")),
+                frontend_policy=frontend_policy,
+                highlight=highlight,
             )
             agents.append(agent)
             fetched_at = _parse_timestamp(row.get("fetched_at"))
@@ -3390,6 +3995,9 @@ __FILTER_SQL__
         return {
             "updated_at": latest_updated_at.astimezone(timezone.utc).isoformat() if latest_updated_at else "",
             "backend": backend,
+            "frontend": {
+                "columns": frontend.columns if frontend and frontend.columns else None,
+            },
             "agents": agents,
         }
 
@@ -3397,8 +4005,9 @@ __FILTER_SQL__
         self,
         history_days: int = 30,
         sources: tuple[SourceConfig, ...] | list[SourceConfig] | None = None,
+        frontend: GlobalFrontendConfig | None = None,
     ) -> dict[str, Any]:
-        return self.build_current_contract(history_days=history_days, sources=sources)
+        return self.build_current_contract(history_days=history_days, sources=sources, frontend=frontend)
 
     def build_history_windows(self, provider: str, days: int, source_id: str | None = None) -> dict[str, Any]:
         row = self.latest_provider_fetch(provider, source_id=source_id)
@@ -3476,6 +4085,7 @@ __FILTER_SQL__
                 )
                 metric, points = _cursor_adjust_monthly_metric_and_points(metric, over_cap_metric, monthly_points, over_cap_points)
                 if non_auto_event_points:
+                    metric = _cursor_adjust_monthly_metric_from_non_auto_events(metric, non_auto_event_points)
                     points = _cursor_monthly_points_from_non_auto_events(metric, non_auto_event_points)
                 elif total_spend_points:
                     points = _cursor_monthly_points_from_total_spend(metric, total_spend_points)
@@ -3590,6 +4200,7 @@ __FILTER_SQL__
             )
             metric_row, points = _cursor_adjust_monthly_metric_and_points(metric_row, over_cap_metric, monthly_points, over_cap_points)
             if non_auto_event_points:
+                metric_row = _cursor_adjust_monthly_metric_from_non_auto_events(metric_row, non_auto_event_points)
                 points = _cursor_monthly_points_from_non_auto_events(metric_row, non_auto_event_points)
             elif total_spend_points:
                 points = _cursor_monthly_points_from_total_spend(metric_row, total_spend_points)

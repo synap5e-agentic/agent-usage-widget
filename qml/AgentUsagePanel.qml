@@ -9,6 +9,7 @@ Item {
 
   property var agents: []
   property var backend: ({})
+  property var frontend: ({})
   property string updatedAt: ""
   property real currentTime: Date.now()
   property bool showCloseButton: true
@@ -19,7 +20,8 @@ Item {
   signal closeRequested()
 
   readonly property real cardMinWidth: Math.round(330 * Style.uiScaleRatio)
-  readonly property int cardColumns: orderedAgents.length >= 3 ? 3 : (orderedAgents.length > 1 ? 2 : 1)
+  readonly property int configuredColumns: frontend && frontend.columns ? parseInt(frontend.columns, 10) : 0
+  readonly property int cardColumns: configuredColumns > 0 ? configuredColumns : (orderedAgents.length >= 3 ? 3 : (orderedAgents.length > 1 ? 2 : 1))
   readonly property var orderedAgents: orderAgents(agents)
 
   readonly property var geometryPlaceholder: mainContainer
@@ -46,51 +48,60 @@ Item {
     return "Updated " + h + ":" + (m < 10 ? "0" : "") + m + suffix;
   }
 
-  function providerRank(agent) {
-    const order = { "claude": 0, "codex": 1, "cursor": 2 };
-    const provider = (agent && (agent.provider || agent.id)) || "";
-    return order.hasOwnProperty(provider) ? order[provider] : 99;
+  function frontendPolicy(agent) {
+    return (agent && agent.frontend) || ({});
+  }
+
+  function agentOrder(agent, fallback) {
+    const policy = frontendPolicy(agent);
+    const parsed = parseInt(policy.order, 10);
+    return isNaN(parsed) ? fallback : parsed;
   }
 
   function orderAgents(list) {
-    const items = (list || []).slice();
-    items.sort(function(a, b) {
-      const rankDiff = providerRank(a) - providerRank(b);
-      if (rankDiff !== 0) return rankDiff;
-      return (a.label || "").localeCompare(b.label || "");
+    const items = (list || []).map(function(agent, index) {
+      return { agent: agent, index: index };
     });
-    return items;
+    items.sort(function(a, b) {
+      const rankDiff = agentOrder(a.agent, a.index + 1000) - agentOrder(b.agent, b.index + 1000);
+      if (rankDiff !== 0) return rankDiff;
+      return (a.agent.label || "").localeCompare(b.agent.label || "");
+    });
+    return items.map(function(item) { return item.agent; });
   }
 
   function shouldShowMetric(agent, metric) {
-    const provider = (agent && (agent.provider || agent.id)) || "";
-    const key = ((metric && metric.metric_key) || "").toLowerCase();
-    const providerKey = ((metric && metric.provider_metric_key) || "").toLowerCase();
-    const path = ((metric && metric.metric_path) || "").toLowerCase();
-    if (provider === "claude" && (key.indexOf("omelette") !== -1 || providerKey.indexOf("omelette") !== -1 || path.indexOf("omelette") !== -1))
-      return false;
-    if (provider === "cursor" && (key === "api_usage" || key === "auto_usage" || key === "provider_total_usage" || key === "included_spend" || key === "total_spend" || key.indexOf("model_") === 0))
-      return false;
-    return true;
+    const policy = (metric && metric.frontend) || ({});
+    return policy.visible !== false;
+  }
+
+  function graphEntries(agent) {
+    const entries = [];
+    const policy = frontendPolicy(agent);
+    const graphs = (agent && agent.graphs) || {};
+    const order = (policy.graph_order && policy.graph_order.length) ? policy.graph_order : Object.keys(graphs);
+    for (const key of order) {
+      const graph = graphs[key];
+      if (!graph) continue;
+      entries.push(graph);
+    }
+    return entries;
   }
 
   function graphMetricIds(agent) {
-    const ids = [];
-    const graphs = (agent && agent.graphs) || {};
-    for (const key of ["long_window", "short_window"]) {
-      const graph = graphs[key];
-      if (!graph) continue;
-      if (graph.metric_path) ids.push(graph.metric_path);
-      else if (graph.metric_key) ids.push(graph.metric_key);
-    }
-    return ids;
+    return graphEntries(agent).map(function(graph) {
+      return graph.metric_path || graph.metric_key || "";
+    }).filter(function(id) { return id.length > 0; });
   }
 
   function primaryMetrics(agent) {
     const ids = graphMetricIds(agent);
     return ((agent && agent.metrics) || []).filter(function(metric) {
       const id = metric.metric_path || metric.metric_key || "";
-      return ids.indexOf(id) !== -1 && shouldShowMetric(agent, metric);
+      const policy = (metric && metric.frontend) || ({});
+      if (!shouldShowMetric(agent, metric)) return false;
+      if (policy.section) return policy.section === "primary";
+      return ids.indexOf(id) !== -1;
     });
   }
 
@@ -98,7 +109,10 @@ Item {
     const ids = graphMetricIds(agent);
     return ((agent && agent.metrics) || []).filter(function(metric) {
       const id = metric.metric_path || metric.metric_key || "";
-      return ids.indexOf(id) === -1 && shouldShowMetric(agent, metric);
+      const policy = (metric && metric.frontend) || ({});
+      if (!shouldShowMetric(agent, metric)) return false;
+      if (policy.section) return policy.section !== "primary";
+      return ids.indexOf(id) === -1;
     });
   }
 
@@ -109,12 +123,9 @@ Item {
     return String(status.message || status.label || "").trim();
   }
 
-  function graphAccent(metric) {
-    const key = metric && metric.metric_key;
-    if (key === "five_hour" || key === "primary_window" || key === "auto_spend") return "secondary";
-    if (key === "secondary_window" || key === "spark_usage" || key === "spark") return "tertiary";
-    if (key === "seven_day" || key === "sonnet_usage" || key === "sonnet") return "primary";
-    return metric ? metric.accent : null;
+  function metricHighlightActive(metric) {
+    const policy = (metric && metric.frontend) || ({});
+    return policy.highlight_active === true;
   }
 
   Rectangle {
@@ -181,7 +192,7 @@ Item {
           anchors.fill: parent
           anchors.margins: Style.marginM
           wrapMode: Text.Wrap
-          text: root.emptyMessage
+          text: (backend && backend.message) ? backend.message : root.emptyMessage
           pointSize: Style.fontSizeXS
           color: Color.mOnSurfaceVariant
         }
@@ -277,13 +288,13 @@ Item {
                         Layout.fillWidth: true
                       }
 
-                      NText {
-                        text: modelData.value
-                        pointSize: Style.fontSizeS
-                        font.family: Settings.data.ui.fontFixed
-                        font.weight: Style.fontWeightBold
-                        color: modelData.percent !== undefined ? root.accentColor(modelData.accent || "primary") : Color.mOnSurface
-                      }
+                    NText {
+                      text: modelData.value
+                      pointSize: Style.fontSizeS
+                      font.family: Settings.data.ui.fontFixed
+                      font.weight: Style.fontWeightBold
+                      color: root.metricHighlightActive(modelData) ? root.accentColor(modelData.accent || "primary") : (modelData.percent !== undefined ? root.accentColor(modelData.accent || "primary") : Color.mOnSurface)
+                    }
                     }
 
                     Rectangle {
@@ -297,7 +308,7 @@ Item {
                         width: parent.width * (Math.max(0, Math.min(100, modelData.percent)) / 100)
                         height: parent.height
                         radius: parent.radius
-                        color: root.accentColor(modelData.accent || "primary")
+                        color: root.metricHighlightActive(modelData) ? root.accentColor("secondary") : root.accentColor(modelData.accent || "primary")
                         Behavior on width { NumberAnimation { duration: 300 } }
                       }
                     }
@@ -310,10 +321,7 @@ Item {
                 spacing: Style.marginXS
 
                 Repeater {
-                  model: [
-                    modelData.graphs ? modelData.graphs.long_window : null,
-                    modelData.graphs ? modelData.graphs.short_window : null
-                  ]
+                  model: root.graphEntries(modelData)
 
                   delegate: ColumnLayout {
                     required property var modelData
@@ -332,7 +340,7 @@ Item {
                       Layout.preferredHeight: Math.round(120 * Style.uiScaleRatio)
                       graph: modelData || ({})
                       nowMs: root.currentTime
-                      accentColor: root.accentColor(root.graphAccent(modelData))
+                      accentColor: root.accentColor(modelData ? (modelData.accent || "primary") : "primary")
                     }
                   }
                 }
@@ -365,7 +373,8 @@ Item {
                         text: modelData.value
                         pointSize: Style.fontSizeS
                         font.family: Settings.data.ui.fontFixed
-                        color: Color.mOnSurfaceVariant
+                        font.weight: root.metricHighlightActive(modelData) ? Style.fontWeightBold : Font.Normal
+                        color: root.metricHighlightActive(modelData) ? root.accentColor(modelData.accent || "primary") : Color.mOnSurfaceVariant
                       }
                     }
 
@@ -380,7 +389,7 @@ Item {
                         width: parent.width * (Math.max(0, Math.min(100, modelData.percent)) / 100)
                         height: parent.height
                         radius: parent.radius
-                        color: Qt.rgba(Color.mOnSurfaceVariant.r, Color.mOnSurfaceVariant.g, Color.mOnSurfaceVariant.b, 0.55)
+                        color: root.metricHighlightActive(modelData) ? root.accentColor("secondary") : Qt.rgba(Color.mOnSurfaceVariant.r, Color.mOnSurfaceVariant.g, Color.mOnSurfaceVariant.b, 0.55)
                         Behavior on width { NumberAnimation { duration: 300 } }
                       }
                     }

@@ -12,17 +12,15 @@ import sys
 import tempfile
 from pathlib import Path
 from textwrap import dedent
-from urllib.error import URLError
 from urllib.request import urlopen
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_IMPORT_ROOT_FILE = ROOT / ".cache" / "noctalia-qml-import-root"
-DEFAULT_STATE_FILE = Path.home() / ".cache" / "agent-usage" / "state.json"
 DEFAULT_SERVICE_URL = "http://127.0.0.1:8785/api/current"
 DEFAULT_NOCTALIA_SETTINGS_FILE = Path.home() / ".config" / "noctalia" / "settings.json"
 DEFAULT_NOCTALIA_COLORS_FILE = Path.home() / ".config" / "noctalia" / "colors.json"
 DEFAULT_PANEL_WIDTH = 1053
-DEFAULT_PANEL_HEIGHT = 591
+DEFAULT_PANEL_HEIGHT = 0
 DEFAULT_BAR_WIDTH = 207
 DEFAULT_BAR_HEIGHT = 36
 DEFAULT_NOCTALIA_COLORS = {
@@ -124,16 +122,9 @@ def _qml_url(path: Path) -> str:
     return path.resolve().as_uri()
 
 
-def _load_payload(service_url: str, state_file: Path) -> tuple[dict[str, object], str]:
-    try:
-        with urlopen(service_url, timeout=2) as response:
-            return json.load(response), "service"
-    except (URLError, TimeoutError, json.JSONDecodeError, OSError):
-        pass
-
-    if not state_file.exists():
-        raise FileNotFoundError(f"Neither {service_url} nor {state_file} provided a readable payload")
-    return json.loads(state_file.read_text(encoding="utf-8")), "state"
+def _load_payload(service_url: str) -> tuple[dict[str, object], str]:
+    with urlopen(service_url, timeout=2) as response:
+        return json.load(response), "service"
 
 
 def _read_json_file(path: Path) -> dict[str, object] | None:
@@ -741,6 +732,7 @@ TestCase {{
     id: fakeMain
     property var agents: testRoot.payload.agents || []
     property var backend: testRoot.payload.backend || ({{}})
+    property var frontend: testRoot.payload.frontend || ({{}})
     property string updatedAt: String(testRoot.payload.updated_at || "")
     property real currentTime: Date.now()
 
@@ -783,6 +775,91 @@ TestCase {{
 """.strip()
 
 
+def _measure_test_source(component_path: Path, payload: dict[str, object], output: Path, width: int, height: int, component_kind: str) -> str:
+    payload_json = json.dumps(payload, sort_keys=True)
+    component_url = _qml_url(component_path)
+    object_props = f"""{{
+      width: {width},
+      height: {height},
+      pluginApi: testRoot.pluginApi()
+    }}"""
+    if component_kind == "bar":
+        object_props = f"""{{
+      width: {width},
+      height: {height},
+      screen: fakeScreen,
+      widgetId: "agent-usage",
+      section: "left",
+      sectionWidgetIndex: 0,
+      sectionWidgetsCount: 1,
+      pluginApi: testRoot.pluginApi()
+    }}"""
+    return f"""
+import QtQuick
+import QtTest
+import Quickshell
+import qs.Commons
+
+TestCase {{
+  id: testRoot
+  name: "WidgetMeasure"
+  when: windowShown
+  width: {width}
+  height: {height}
+
+  property var payload: ({payload_json})
+
+  ShellScreen {{
+    id: fakeScreen
+    name: "screenshot"
+  }}
+
+  QtObject {{
+    id: fakeMain
+    property var agents: testRoot.payload.agents || []
+    property var backend: testRoot.payload.backend || ({{}})
+    property var frontend: testRoot.payload.frontend || ({{}})
+    property string updatedAt: String(testRoot.payload.updated_at || "")
+    property real currentTime: Date.now()
+
+    function accentColor(name) {{
+      if (name === "secondary") return Color.mSecondary;
+      if (name === "tertiary") return Color.mTertiary;
+      return Color.mPrimary;
+    }}
+
+    function backendSummary() {{
+      if (!backend || !backend.label) return "Waiting for backend";
+      return backend.label + (backend.transport ? " via " + backend.transport : "");
+    }}
+  }}
+
+  function pluginApi() {{
+    return {{
+      mainInstance: fakeMain,
+      withCurrentScreen: function(callback) {{ callback(fakeScreen); }},
+      closePanel: function(_screen) {{}},
+      togglePanel: function(_screen, _target) {{}}
+    }};
+  }}
+
+  function test_measure_fixture() {{
+    const component = Qt.createComponent("{component_url}");
+    compare(component.status, Component.Ready, component.errorString());
+    const item = component.createObject(testRoot, {object_props});
+    verify(item !== null);
+    wait(50);
+    const result = {{
+      preferredWidth: Number(item.contentPreferredWidth || item.implicitWidth || item.width || 0),
+      preferredHeight: Number(item.contentPreferredHeight || item.implicitHeight || item.height || 0)
+    }};
+    console.log("MEASURE:" + JSON.stringify(result));
+    item.destroy();
+  }}
+}}
+""".strip()
+
+
 def _render(
     runner: str,
     import_roots: list[Path],
@@ -817,14 +894,54 @@ def _render(
         raise RuntimeError(f"Renderer completed without writing {output}")
 
 
+def _measure(
+    runner: str,
+    import_roots: list[Path],
+    platform: str,
+    component_path: Path,
+    payload: dict[str, object],
+    width: int,
+    height: int,
+    tmp_path: Path,
+    component_kind: str,
+) -> tuple[int, int]:
+    test_file = tmp_path / f"tst_measure_{component_path.stem}.qml"
+    test_file.write_text(_measure_test_source(component_path, payload, tmp_path / f"measure_{component_path.stem}.json", width, height, component_kind) + "\n", encoding="utf-8")
+    env = os.environ.copy()
+    env["QT_QPA_PLATFORM"] = platform
+    env.setdefault("QML_DISABLE_DISK_CACHE", "1")
+    env.setdefault("QT_QUICK_BACKEND", "software")
+    env.setdefault("QT_STYLE_OVERRIDE", "Fusion")
+    env.pop("QT_QPA_PLATFORMTHEME", None)
+    cmd = [
+        runner,
+        "-platform",
+        platform,
+    ]
+    for import_root in import_roots:
+        cmd += ["-import", str(import_root)]
+    cmd += ["-input", str(test_file)]
+    result = subprocess.run(cmd, cwd=ROOT, env=env, check=True, capture_output=True, text=True)
+    measured = None
+    for line in (result.stdout + "\n" + result.stderr).splitlines():
+        marker = "MEASURE:"
+        if marker in line:
+            measured = json.loads(line.split(marker, 1)[1])
+            break
+    if measured is None:
+        raise RuntimeError(f"Measurement completed without emitting preferred size for {component_path}")
+    measured_width = int(round(float(measured.get("preferredWidth") or width)))
+    measured_height = int(round(float(measured.get("preferredHeight") or height)))
+    return max(1, measured_width), max(1, measured_height)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--service-url", default=DEFAULT_SERVICE_URL, help="Primary payload URL, defaults to local /api/current")
-    parser.add_argument("--state-file", default=str(DEFAULT_STATE_FILE), help="Fallback state.json path")
+    parser.add_argument("--service-url", default=DEFAULT_SERVICE_URL, help="Payload URL, defaults to local /api/current")
     parser.add_argument("--panel-output", default="/tmp/agent-usage-panel.png", help="Rendered panel PNG path")
     parser.add_argument("--bar-output", default="/tmp/agent-usage-bar.png", help="Rendered bar PNG path")
     parser.add_argument("--panel-width", type=int, default=DEFAULT_PANEL_WIDTH)
-    parser.add_argument("--panel-height", type=int, default=DEFAULT_PANEL_HEIGHT)
+    parser.add_argument("--panel-height", type=int, default=DEFAULT_PANEL_HEIGHT, help="Panel height in px; use 0 to auto-size from contentPreferredHeight")
     parser.add_argument("--bar-width", type=int, default=DEFAULT_BAR_WIDTH)
     parser.add_argument("--bar-height", type=int, default=DEFAULT_BAR_HEIGHT)
     parser.add_argument("--platform", default=os.environ.get("QML_RENDER_PLATFORM", "offscreen"), help="Qt platform plugin for qmltestrunner")
@@ -844,7 +961,7 @@ def main() -> int:
         source_root,
     )
 
-    payload, source = _load_payload(args.service_url, Path(args.state_file).expanduser())
+    payload, source = _load_payload(args.service_url)
     print(f"Using payload source: {source}")
     print(f"Using Noctalia theme source: {theme_source}")
 
@@ -852,6 +969,20 @@ def main() -> int:
         tmp_path = Path(tmp)
         preview_import_root = _write_preview_imports(tmp_path, settings, colors, source_root)
         import_roots = [preview_import_root]
+        panel_width = args.panel_width
+        panel_height = args.panel_height
+        if panel_height <= 0:
+            _, panel_height = _measure(
+                runner,
+                import_roots,
+                args.platform,
+                ROOT / "noctalia_plugin" / "Panel.qml",
+                payload,
+                panel_width,
+                4096,
+                tmp_path,
+                "panel",
+            )
 
         _render(
             runner,
@@ -860,8 +991,8 @@ def main() -> int:
             ROOT / "noctalia_plugin" / "Panel.qml",
             payload,
             Path(args.panel_output).expanduser(),
-            args.panel_width,
-            args.panel_height,
+            panel_width,
+            panel_height,
             tmp_path,
             "panel",
         )

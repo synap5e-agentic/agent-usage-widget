@@ -5,11 +5,22 @@ port = 8785
 [poller]
 default_interval_seconds = 60
 
+[frontend]
+columns = 3
+
 [sources.personal]
 provider = "claude"
 label = "Claude Personal"
 frontend_visible = true
 enabled = false
+
+[sources.personal.frontend]
+order = 10
+short_label = "CP"
+show_metrics = ["seven_day", "five_hour", "extra_usage"]
+show_graphs = ["seven_day", "five_hour"]
+highlight_metric = "extra_usage"
+highlight_window_minutes = 34
 
 [sources.personal.auth]
 cookie = ""
@@ -20,6 +31,14 @@ label = "Claude Work"
 frontend_visible = true
 enabled = false
 
+[sources.work.frontend]
+order = 20
+short_label = "CW"
+show_metrics = ["seven_day", "five_hour", "extra_usage"]
+show_graphs = ["seven_day", "five_hour"]
+highlight_metric = "extra_usage"
+highlight_window_minutes = 34
+
 [sources.work.auth]
 cookie = ""
 
@@ -28,6 +47,12 @@ provider = "codex"
 label = "Codex"
 frontend_visible = true
 enabled = false
+
+[sources.codex.frontend]
+order = 30
+short_label = "Cx"
+show_metrics = ["secondary_window", "primary_window"]
+show_graphs = ["secondary_window", "primary_window"]
 
 [sources.codex.auth]
 authorization = ""
@@ -38,6 +63,12 @@ provider = "cursor"
 label = "Cursor"
 frontend_visible = true
 enabled = false
+
+[sources.cursor.frontend]
+order = 40
+short_label = "Cu"
+show_metrics = ["monthly", "auto_spend", "over_cap_used"]
+show_graphs = ["monthly", "auto_spend"]
 
 [sources.cursor.auth]
 cookie = ""

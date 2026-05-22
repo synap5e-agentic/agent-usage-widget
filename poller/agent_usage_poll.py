@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import json
 from datetime import datetime, timezone
-from pathlib import Path
 
 import sys
 from pathlib import Path as _Path
@@ -23,7 +22,6 @@ from poller.agent_usage_common import (  # type: ignore  # noqa: E402
     load_config,
     run_fetch,
     sync_cursor_usage_events,
-    write_state_file,
 )
 
 
@@ -34,18 +32,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--print-state",
         action="store_true",
-        help="Print contract JSON instead of only writing state file",
-    )
-    parser.add_argument(
-        "--state-file",
-        default=None,
-        help="Write compat JSON snapshot to path",
+        help="Print current service contract JSON after polling",
     )
     parser.add_argument(
         "--history-days",
         type=int,
         default=30,
-        help="History points window for state.json compatibility payload",
+        help="History points window for the printed service contract",
     )
     parser.add_argument(
         "--provider",
@@ -74,8 +67,6 @@ def _load_config(args: argparse.Namespace) -> AppConfig:
         overrides["AGENT_USAGE_CONFIG_FILE"] = args.config_file
     if args.env_file:
         overrides["AGENT_USAGE_ENV_FILE"] = args.env_file
-    if args.state_file:
-        overrides["AGENT_USAGE_STATE_FILE"] = args.state_file
     return load_config(overrides)
 
 
@@ -117,13 +108,6 @@ def _should_run_source(
     if not source.enabled:
         return False
     return _source_is_due(source, latest_attempt, force)
-
-
-def _write_compat_state(cfg: AppConfig, client: PostgresClient, history_days: int, path: Path | None) -> None:
-    path = path or cfg.state_path
-    contract = client.build_compat_state(history_days=history_days, sources=cfg.sources)
-    write_state_file(path, contract)
-    print(f"[agent-usage-poll] wrote state file: {path}")
 
 
 def _is_rate_limited(snapshot: ProviderSnapshot) -> bool:
@@ -182,11 +166,9 @@ def main() -> int:
             print(f"[agent-usage-poll] {source.source_id} ({source.provider}): error={exc}", file=sys.stderr)
             continue
 
-    contract = client.build_compat_state(history_days=args.history_days, sources=cfg.sources)
+    contract = client.build_compat_state(history_days=args.history_days, sources=cfg.sources, frontend=cfg.frontend)
     if args.print_state:
         print(json.dumps(contract, indent=2, ensure_ascii=False))
-    if not args.print_state:
-        _write_compat_state(cfg, client, args.history_days, cfg.state_path if not args.state_file else Path(args.state_file))
 
     return 0
 

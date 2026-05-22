@@ -20,6 +20,7 @@ Item {
     anchors.fill: parent
     agents: root.mainInstance ? (root.mainInstance.agents || []) : []
     backend: root.mainInstance ? (root.mainInstance.backend || ({})) : ({})
+    frontend: root.mainInstance ? (root.mainInstance.frontend || ({})) : ({})
     updatedAt: root.mainInstance ? root.mainInstance.updatedAt : ""
     currentTime: root.mainInstance ? root.mainInstance.currentTime : Date.now()
     accentColorFn: function(name) {

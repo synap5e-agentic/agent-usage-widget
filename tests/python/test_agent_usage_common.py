@@ -69,6 +69,20 @@ def test_normalize_graph_points_sorts_and_collapses_duplicate_timestamps() -> No
     ]
 
 
+def test_collect_metric_rows_infers_new_zero_window_when_reset_timestamp_is_missing() -> None:
+    rows = common._collect_metric_rows(
+        "claude",
+        {"five_hour": {"utilization": 0.0, "resets_at": None}},
+        fetched_at="2026-04-30T01:50:10+00:00",
+    )
+
+    metric = next(row for row in rows if row["metric_key"] == "five_hour")
+    assert metric["percent"] == 0
+    assert metric["window_start"] == "2026-04-30T01:50:10+00:00"
+    assert metric["window_end"] == "2026-04-30T06:50:10+00:00"
+    assert metric["reset_at"] == "2026-04-30T06:50:10+00:00"
+
+
 def test_graph_from_metric_reanchors_rolled_window_without_bridging_old_cycle() -> None:
     graph = common._graph_from_metric(
         metric(
@@ -118,6 +132,84 @@ def test_graph_from_metric_allows_empty_and_single_point_series() -> None:
 
     assert empty_graph["points"] == []
     assert single_graph["points"] == [{"t": epoch("2026-04-01T00:00:00+00:00"), "value": 1}]
+
+
+def test_pick_metric_by_selector_prefers_exact_metric_key_over_spark_alias_path() -> None:
+    metrics = [
+        metric(
+            metric_key="spark_usage",
+            provider_metric_key="secondary_window",
+            metric_path="/additional_rate_limits/0/rate_limit/secondary_window",
+            metric_label="Spark this week",
+        ),
+        metric(
+            metric_key="secondary_window",
+            provider_metric_key="secondary_window",
+            metric_path="/rate_limit/secondary_window",
+            metric_label="This week",
+        ),
+    ]
+
+    picked = common._pick_metric_by_selector(metrics, "secondary_window")
+
+    assert picked is not None
+    assert picked["metric_key"] == "secondary_window"
+    assert picked["metric_path"] == "/rate_limit/secondary_window"
+
+
+def test_provider_default_frontend_for_codex_only_shows_current_windows() -> None:
+    frontend = common._provider_default_frontend("codex")
+
+    assert frontend["show_metrics"] == ["secondary_window", "primary_window"]
+    assert frontend["show_graphs"] == ["secondary_window", "primary_window"]
+
+
+def test_metric_selector_index_does_not_treat_spark_aliases_as_visible_window_metrics() -> None:
+    spark_metric = metric(
+        metric_key="spark_usage",
+        provider_metric_key="secondary_window",
+        metric_path="/additional_rate_limits/0/rate_limit/secondary_window",
+        metric_label="Spark this week",
+    )
+
+    assert common._metric_selector_index(spark_metric, ["secondary_window", "primary_window"]) is None
+    assert common._metric_visible(spark_metric, ["secondary_window", "primary_window"]) is False
+
+
+def test_cursor_monthly_metric_uses_non_auto_event_total_when_available() -> None:
+    monthly_metric = metric(
+        metric_key="monthly",
+        provider_metric_key="included",
+        metric_path="/individualUsage/breakdown/included",
+        percent=100,
+        value="1577%",
+        value_num=31547,
+        details={
+            "limit_cents": 2000,
+            "total_spend_cents": 31547,
+            "graph_reference_value": 100,
+        },
+    )
+
+    adjusted = common._cursor_adjust_monthly_metric_from_non_auto_events(
+        monthly_metric,
+        [
+            {"t": epoch("2026-04-05T14:10:00+00:00"), "value": 21},
+            {"t": epoch("2026-04-30T10:00:00+00:00"), "value": 4832},
+        ],
+    )
+    points = common._cursor_monthly_points_from_non_auto_events(
+        adjusted,
+        [
+            {"t": epoch("2026-04-05T14:10:00+00:00"), "value": 21},
+            {"t": epoch("2026-04-30T10:00:00+00:00"), "value": 4832},
+        ],
+    )
+
+    assert adjusted["value_num"] == 4832
+    assert adjusted["percent"] == 242
+    assert adjusted["value"] == "242%"
+    assert points[-1]["value"] == 242
 
 
 def test_provider_status_marks_auth_failure_as_stale() -> None:
@@ -179,9 +271,20 @@ port = 8786
 [poller]
 default_interval_seconds = 60
 
+[frontend]
+columns = 2
+
 [sources.personal]
 provider = "claude"
 label = "Claude Personal"
+
+[sources.personal.frontend]
+order = 10
+short_label = "CP"
+show_metrics = ["seven_day", "five_hour", "extra_usage"]
+show_graphs = ["seven_day", "five_hour"]
+highlight_metric = "extra_usage"
+highlight_window_minutes = 34
 
 [sources.personal.auth]
 cookie = "lastActiveOrg=org-personal; sessionKey=session"
@@ -206,11 +309,18 @@ cookie = "lastActiveOrg=org-work; sessionKey=session"
 
     assert cfg.service_port == 8786
     assert cfg.poller_default_interval_seconds == 60
+    assert cfg.frontend.columns == 2
     assert [source.source_id for source in cfg.sources] == ["personal", "work"]
     assert cfg.sources[0].label == "Claude Personal"
     assert cfg.sources[0].frontend_visible is True
     assert cfg.sources[0].enabled is True
     assert cfg.sources[0].interval_seconds == 60
+    assert cfg.sources[0].frontend.order == 10
+    assert cfg.sources[0].frontend.short_label == "CP"
+    assert cfg.sources[0].frontend.show_metrics == ("seven_day", "five_hour", "extra_usage")
+    assert cfg.sources[0].frontend.show_graphs == ("seven_day", "five_hour")
+    assert cfg.sources[0].frontend.highlight_metric == "extra_usage"
+    assert cfg.sources[0].frontend.highlight_window_minutes == 34
     assert cfg.sources[1].label == "work"
     assert cfg.sources[1].frontend_visible is False
     assert cfg.sources[1].interval_seconds == 1800
@@ -249,6 +359,41 @@ def test_normalize_claude_uses_org_from_cookie_or_url() -> None:
 
     assert snapshot.account_id == "org-cookie"
     assert snapshot.organization_id == "org-cookie"
+
+
+def test_normalize_claude_extra_usage_as_money_metric() -> None:
+    cfg = common.load_config(
+        {
+            "AGENT_USAGE_CLAUDE_COOKIE": "lastActiveOrg=org-cookie",
+            "AGENT_USAGE_CLAUDE_ORGANIZATION_ID": "",
+        }
+    )
+
+    snapshot = common.normalize_claude(
+        {
+            "seven_day": {"utilization": 6.0},
+            "extra_usage": {
+                "is_enabled": True,
+                "monthly_limit": None,
+                "used_credits": 1917.0,
+                "utilization": None,
+                "currency": "USD",
+            },
+        },
+        cfg,
+        "https://claude.ai/api/organizations/org-cookie/usage",
+        200,
+        None,
+    )
+
+    extra = next(metric for metric in snapshot.metrics if metric["metric_key"] == "extra_usage")
+    assert extra["metric_path"] == "/extra_usage"
+    assert extra["metric_label"] == "Extra usage"
+    assert extra["value_num"] == 1917.0
+    assert extra["value"] == "$19.17"
+    assert extra["percent"] == 0
+    assert extra["details"]["graph_value_kind"] == "currency_cents"
+    assert extra["details"]["currency"] == "USD"
 
 
 def test_codex_auth_headers_support_cookie_only_mode() -> None:
@@ -510,6 +655,26 @@ def test_history_points_can_scope_by_source_id() -> None:
     assert "AND f.source_id = :'source_id'" in sql
     assert vars is not None
     assert vars["source_id"] == "personal"
+
+
+def test_cursor_usage_cumulative_points_deduplicates_streaming_updates() -> None:
+    client = RecordingClient(response=[{"t": 1775001600, "value": 49}])
+
+    points = client.cursor_usage_cumulative_points(
+        "2026-06-05T02:10:02+00:00",
+        model="default",
+        source_id="cursor",
+    )
+
+    sql, vars = client.calls[-1]
+    assert points == [{"t": 1775001600, "value": 49}]
+    assert "WITH deduped AS" in sql
+    assert "MAX(COALESCE(e.charged_cents, 0)) AS charged_cents" in sql
+    assert "GROUP BY e.event_timestamp_ms, COALESCE(e.model, '')" in sql
+    assert vars is not None
+    assert vars["cycle_end"] == "2026-06-05T02:10:02+00:00"
+    assert vars["model"] == "default"
+    assert vars["source_id"] == "cursor"
 
 
 class CursorSpendClient(common.PostgresClient):
@@ -986,6 +1151,124 @@ class MultiClaudeClient(common.PostgresClient):
         return []
 
 
+class ExtraUsagePolicyClient(MultiClaudeClient):
+    def __init__(self):
+        super().__init__()
+        self.history_calls: list[dict[str, Any]] = []
+
+    def latest_metrics(self, fetch_id: int) -> list[dict[str, Any]]:
+        return [
+            {
+                "source_id": "personal",
+                "metric_key": "seven_day",
+                "provider_metric_key": "seven_day",
+                "metric_path": "/seven_day",
+                "metric_scope": "/",
+                "metric_label": "This week",
+                "percent": 21,
+                "value_num": 21,
+                "value_text": "21%",
+                "note": "",
+                "max_value": 100,
+                "window_start": "",
+                "window_end": "",
+                "reset_at": "",
+                "details": {},
+            },
+            {
+                "source_id": "personal",
+                "metric_key": "five_hour",
+                "provider_metric_key": "five_hour",
+                "metric_path": "/five_hour",
+                "metric_scope": "/",
+                "metric_label": "5-hour window",
+                "percent": 7,
+                "value_num": 7,
+                "value_text": "7%",
+                "note": "",
+                "max_value": 100,
+                "window_start": "",
+                "window_end": "",
+                "reset_at": "",
+                "details": {},
+            },
+            {
+                "source_id": "personal",
+                "metric_key": "extra_usage",
+                "provider_metric_key": "extra_usage",
+                "metric_path": "/extra_usage",
+                "metric_scope": "/",
+                "metric_label": "Extra usage",
+                "percent": 0,
+                "value_num": 1917.0,
+                "value_text": "$19.17",
+                "note": "Extra usage billed in USD",
+                "max_value": 2100,
+                "window_start": "",
+                "window_end": "",
+                "reset_at": "",
+                "details": {"graph_value_kind": "currency_cents", "currency": "USD"},
+            },
+            {
+                "source_id": "personal",
+                "metric_key": "internal_noise",
+                "provider_metric_key": "internal_noise",
+                "metric_path": "/internal_noise",
+                "metric_scope": "/",
+                "metric_label": "Internal noise",
+                "percent": 99,
+                "value_num": 99,
+                "value_text": "99%",
+                "note": "",
+                "max_value": 100,
+                "window_start": "",
+                "window_end": "",
+                "reset_at": "",
+                "details": {},
+            },
+        ]
+
+    def history_points(
+        self,
+        provider: str,
+        metric_path: str,
+        days: int,
+        window_start: str | None = None,
+        window_end: str | None = None,
+        source_id: str | None = None,
+        account_id: str | None = None,
+        organization_id: str | None = None,
+        use_value_num: bool = False,
+    ) -> list[dict[str, Any]]:
+        self.history_calls.append(
+            {
+                "provider": provider,
+                "metric_path": metric_path,
+                "source_id": source_id,
+                "use_value_num": use_value_num,
+            }
+        )
+        return []
+
+    def metric_recent_increase(
+        self,
+        provider: str,
+        metric: str,
+        window_minutes: int,
+        source_id: str | None = None,
+        account_id: str | None = None,
+        organization_id: str | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "active": True,
+            "metric": metric,
+            "window_minutes": window_minutes,
+            "delta": 125.0,
+            "current_value": 1917.0,
+            "increased_at": epoch("2026-04-25T01:55:00+00:00"),
+        }
+
+
 def test_build_current_contract_renders_multiple_sources_for_same_provider() -> None:
     client = MultiClaudeClient()
     sources = (
@@ -1012,3 +1295,51 @@ def test_build_current_contract_filters_frontend_invisible_sources() -> None:
     payload = client.build_current_contract(history_days=30, sources=sources)
 
     assert [agent["id"] for agent in payload["agents"]] == ["personal"]
+
+
+def test_build_current_contract_exposes_frontend_policy_and_extra_usage_highlight() -> None:
+    client = ExtraUsagePolicyClient()
+    sources = (
+        common.SourceConfig(
+            "personal",
+            "claude",
+            "Claude Personal",
+            frontend=common.SourceFrontendConfig(
+                order=7,
+                short_label="CP",
+                show_metrics=("extra_usage", "seven_day"),
+                show_graphs=("seven_day",),
+                highlight_metric="extra_usage",
+                highlight_window_minutes=34,
+            ),
+        ),
+    )
+
+    payload = client.build_current_contract(
+        history_days=30,
+        sources=sources,
+        frontend=common.GlobalFrontendConfig(columns=1),
+    )
+
+    assert payload["frontend"] == {"columns": 1}
+    agent = payload["agents"][0]
+    assert agent["frontend"]["order"] == 7
+    assert agent["frontend"]["short_label"] == "CP"
+    assert agent["frontend"]["show_metrics"] == ["extra_usage", "seven_day"]
+    assert agent["frontend"]["graph_order"] == ["long_window"]
+    assert agent["highlight"]["active"] is True
+    assert agent["highlight"]["metric"] == "extra_usage"
+    assert agent["highlight"]["window_minutes"] == 34
+
+    metrics = {metric["metric_key"]: metric for metric in agent["metrics"]}
+    assert list(metrics) == ["extra_usage", "seven_day", "five_hour", "internal_noise"]
+    assert metrics["extra_usage"]["value"] == "$19.17"
+    assert metrics["extra_usage"]["show_bar"] is False
+    assert metrics["extra_usage"]["value_kind"] == "currency_cents"
+    assert metrics["extra_usage"]["frontend"]["visible"] is True
+    assert metrics["extra_usage"]["frontend"]["section"] == "secondary"
+    assert metrics["extra_usage"]["frontend"]["highlight_active"] is True
+    assert metrics["seven_day"]["frontend"]["section"] == "primary"
+    assert metrics["five_hour"]["frontend"]["visible"] is False
+    assert metrics["internal_noise"]["frontend"]["visible"] is False
+    assert any(call["metric_path"] == "/extra_usage" and call["use_value_num"] for call in client.history_calls)

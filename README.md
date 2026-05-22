@@ -14,7 +14,7 @@ This repo includes a poller, a local HTTP service, a reusable QML UI layer, and 
 2. `agent-usage-service` serves `/api/current`, `/api/history`, and `/api/raw/latest`.
 3. `qml/` contains reusable QML components for the bar, panel, and graphs.
 4. `noctalia_plugin/` contains the thin Noctalia / Quickshell adapter layer.
-5. `~/.cache/agent-usage/state.json` exists only as a compatibility fallback for the QML side.
+5. The Noctalia plugin reads only the local HTTP service; if the service is down, the UI shows that directly instead of falling back to a cached snapshot.
 
 ## Repo Layout
 
@@ -61,10 +61,21 @@ port = 8785
 [poller]
 default_interval_seconds = 60
 
+[frontend]
+columns = 3
+
 [sources.personal]
 provider = "claude"
 label = "Claude Personal"
 frontend_visible = true
+
+[sources.personal.frontend]
+order = 10
+short_label = "CP"
+show_metrics = ["seven_day", "five_hour", "extra_usage"]
+show_graphs = ["seven_day", "five_hour"]
+highlight_metric = "extra_usage"
+highlight_window_minutes = 34
 
 [sources.personal.auth]
 cookie = "..."
@@ -75,6 +86,14 @@ label = "Claude Work"
 frontend_visible = true
 interval_seconds = 1800
 
+[sources.work.frontend]
+order = 20
+short_label = "CW"
+show_metrics = ["seven_day", "five_hour", "extra_usage"]
+show_graphs = ["seven_day", "five_hour"]
+highlight_metric = "extra_usage"
+highlight_window_minutes = 34
+
 [sources.work.auth]
 cookie = "..."
 
@@ -83,12 +102,20 @@ provider = "codex"
 label = "Codex"
 frontend_visible = true
 
+[sources.codex.frontend]
+order = 30
+short_label = "Cx"
+show_metrics = ["secondary_window", "primary_window"]
+show_graphs = ["secondary_window", "primary_window"]
+
 [sources.codex.auth]
 authorization = "Bearer ..."
 cookie = "..."
 ```
 
 `~/.config/agent-usage-widget/config.toml` is the primary runtime config. Source table names such as `personal` and `work` become stable `source_id` values in the service contract. `label` defaults to the source id, `frontend_visible` and `enabled` default to `true`, and `interval_seconds` defaults to `poller.default_interval_seconds`.
+
+Frontend policy is also read from TOML and returned by `/api/current`. `[frontend].columns` controls panel columns, and `[sources.<name>.frontend]` controls source order, bar short labels, visible metrics, graph selection, and the metric used for recent-increase highlighting. Claude `extra_usage` is normalized as a currency metric; the default Claude policy shows it and highlights the bar when it increased in the last 34 minutes.
 
 The checked-in `poller/config.toml.example` disables placeholder sources so a fresh install does not poll empty credentials. Set `enabled = true` or remove that line after filling in auth.
 
@@ -115,7 +142,7 @@ systemctl --user start agent-usage-poll.service
 Default base URL: `http://127.0.0.1:8785`
 
 - `/health` - service health
-- `/api/current` - current widget contract
+- `/api/current` - current widget contract, including frontend policy and highlight state
 - `/api/history?source=<source_id>&metric=<metric>` - graph history for a configured source
 - `/api/history?provider=<provider>&metric=<metric>` - legacy provider-scoped history
 - `/api/raw/latest?source=<source_id>` - latest stored raw source payload
@@ -157,4 +184,4 @@ Render the current UI from the live service payload:
 python3 scripts/render_widget_screenshots.py
 ```
 
-The renderer writes `/tmp/agent-usage-panel.png` and `/tmp/agent-usage-bar.png` at the README image sizes by default. It renders through the Noctalia plugin wrappers, reads the live `/api/current` payload when available, falls back to `~/.cache/agent-usage/state.json`, and mirrors local Noctalia `settings.json` / `colors.json` for theme and bar sizing.
+The renderer writes `/tmp/agent-usage-panel.png` and `/tmp/agent-usage-bar.png` at the README image sizes by default. It renders through the Noctalia plugin wrappers, reads the live `/api/current` payload, and mirrors local Noctalia `settings.json` / `colors.json` for theme and bar sizing.

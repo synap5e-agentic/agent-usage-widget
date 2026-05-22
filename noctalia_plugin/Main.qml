@@ -9,6 +9,7 @@ Item {
 
   property var agents: []
   property var backend: ({})
+  property var frontend: ({})
   property var configValues: ({})
   property var envConfigValues: ({})
   property var tomlConfigValues: ({})
@@ -19,13 +20,11 @@ Item {
   property real currentTime: Date.now()
   property bool serviceAvailable: false
   property var _serviceRequest: null
+  property int _serviceRequestId: 0
 
   readonly property string homeDir: (Quickshell.env("HOME") || "")
-  readonly property string defaultCacheDir: homeDir + "/.cache/agent-usage"
   readonly property string configFilePath: expandHome(Quickshell.env("AGENT_USAGE_CONFIG_FILE") || (homeDir + "/.config/agent-usage-widget/config.toml"))
   readonly property string envFilePath: expandHome(Quickshell.env("AGENT_USAGE_ENV_FILE") || (homeDir + "/.config/agent-usage-widget/.env"))
-  readonly property string cacheDir: expandHome(runtimeConfigValue("AGENT_USAGE_CACHE_DIR", defaultCacheDir))
-  readonly property string stateFilePath: expandHome(runtimeConfigValue("AGENT_USAGE_STATE_FILE", cacheDir + "/state.json"))
   readonly property string serviceHost: {
     const configured = runtimeConfigValue("AGENT_USAGE_SERVICE_HOST", "127.0.0.1");
     return isLocalHost(configured) ? configured : "127.0.0.1";
@@ -154,8 +153,6 @@ Item {
       }
       if (section === "service" && key === "host") parsed.AGENT_USAGE_SERVICE_HOST = value;
       if (section === "service" && key === "port") parsed.AGENT_USAGE_SERVICE_PORT = value;
-      if ((section === "storage" || section === "poller") && key === "cache_dir") parsed.AGENT_USAGE_CACHE_DIR = value;
-      if ((section === "storage" || section === "poller") && key === "state_file") parsed.AGENT_USAGE_STATE_FILE = value;
     }
     return parsed;
   }
@@ -185,7 +182,6 @@ Item {
 
   function refreshFromConfiguredSources() {
     refreshFromService();
-    if (!root.serviceAvailable) stateFile.reload();
   }
 
   function backendSummary() {
@@ -193,7 +189,7 @@ Item {
     return root.backend.label + (root.backend.transport ? " via " + root.backend.transport : "");
   }
 
-  function applyStatePayload(rawText, sourceLabel) {
+  function applyServicePayload(rawText, sourceLabel) {
     if (!rawText) {
       Logger.w("AgentUsage", sourceLabel + " payload empty");
       return;
@@ -208,6 +204,7 @@ Item {
 
       root.agents = parsed.agents || [];
       root.backend = parsed.backend || ({});
+      root.frontend = parsed.frontend || ({});
       root.updatedAt = parsed.updated_at || "";
       Logger.i("AgentUsage", sourceLabel + " loaded " + root.agents.length + " agents");
       root.serviceAvailable = sourceLabel === "Service";
@@ -217,7 +214,24 @@ Item {
     }
   }
 
+  function clearUnavailableState(reason) {
+    root.agents = [];
+    root.frontend = ({});
+    root.updatedAt = "";
+    root.backend = ({
+      kind: "",
+      label: "Service unavailable",
+      transport: "",
+      message: reason || "agent-usage-service is unavailable",
+    });
+    root.serviceAvailable = false;
+    root.currentTime = Date.now();
+  }
+
   function refreshFromService() {
+    const requestId = root._serviceRequestId + 1;
+    root._serviceRequestId = requestId;
+
     if (root._serviceRequest) {
       try {
         root._serviceRequest.abort();
@@ -228,13 +242,17 @@ Item {
     root._serviceRequest = xhr;
     xhr.onreadystatechange = function() {
       if (xhr.readyState !== XMLHttpRequest.DONE) return;
+      if (requestId !== root._serviceRequestId) return;
 
       if (xhr.status >= 200 && xhr.status < 300) {
-        root.applyStatePayload(xhr.responseText, "Service");
+        root.applyServicePayload(xhr.responseText, "Service");
       } else {
-        root.serviceAvailable = false;
-        stateFile.reload();
+        root.clearUnavailableState("agent-usage-service returned HTTP " + xhr.status);
       }
+    };
+    xhr.onerror = function() {
+      if (requestId !== root._serviceRequestId) return;
+      root.clearUnavailableState("agent-usage-service is unavailable");
     };
     xhr.open("GET", root.serviceCurrentUrl, true);
     xhr.send();
@@ -290,19 +308,6 @@ Item {
       root.configValues = ({});
       root._rejectedServiceHost = "";
       root.refreshFromConfiguredSources();
-    }
-  }
-
-  FileView {
-    id: stateFile
-    path: root.stateFilePath
-
-    onLoaded: {
-      root.applyStatePayload(root.readFileText(stateFile), "Fallback state file");
-    }
-
-    onLoadFailed: function(error) {
-      Logger.w("AgentUsage", "state.json not found: " + error);
     }
   }
 

@@ -18,6 +18,27 @@ Item {
     return Color.mPrimary;
   }
 
+  function agentHighlighted(agent) {
+    const frontendHighlight = agent && agent.frontend && agent.frontend.highlight;
+    const legacyHighlight = agent && agent.highlight;
+    return !!((frontendHighlight && frontendHighlight.active) || (legacyHighlight && legacyHighlight.active));
+  }
+
+  function anyHighlighted() {
+    for (let i = 0; i < (agents || []).length; i++) {
+      if (agentHighlighted(agents[i])) return true;
+    }
+    return false;
+  }
+
+  function highlightBackgroundColor() {
+    const color = accentColor("secondary");
+    if (color && color.r !== undefined) {
+      return Qt.rgba(color.r, color.g, color.b, 0.18);
+    }
+    return Style.capsuleColor;
+  }
+
   implicitWidth: isVertical ? capsuleHeight : mainLayout.implicitWidth + Style.marginXL
   implicitHeight: capsuleHeight
 
@@ -27,10 +48,10 @@ Item {
     y: Style.pixelAlignCenter(parent.height, height)
     width: parent.width
     height: parent.height
-    color: Style.capsuleColor
+    color: root.anyHighlighted() ? root.highlightBackgroundColor() : Style.capsuleColor
     radius: Style.radiusL
-    border.color: Style.capsuleBorderColor
-    border.width: Style.capsuleBorderWidth
+    border.color: root.anyHighlighted() ? root.accentColor("secondary") : Style.capsuleBorderColor
+    border.width: root.anyHighlighted() ? Math.max(Style.capsuleBorderWidth, 2 * Style.uiScaleRatio) : Style.capsuleBorderWidth
 
     RowLayout {
       id: mainLayout
@@ -57,7 +78,7 @@ Item {
             font.family: Settings.data.ui.fontFixed
             font.weight: Style.fontWeightBold
             pointSize: root.barFontSize
-            color: root.accentColor(modelData.accent || "primary")
+            color: root.agentHighlighted(modelData) ? root.accentColor("secondary") : root.accentColor(modelData.accent || "primary")
           }
 
           Rectangle {
@@ -72,7 +93,7 @@ Item {
               width: parent.width
               height: fillHeight
               radius: parent.radius
-              color: root.accentColor(modelData.accent || "primary")
+              color: root.agentHighlighted(modelData) ? root.accentColor("secondary") : root.accentColor(modelData.accent || "primary")
               anchors.bottom: parent.bottom
 
               Behavior on fillHeight {
@@ -85,6 +106,7 @@ Item {
           NText {
             text: modelData.summary ? modelData.summary.value : "--"
             font.family: Settings.data.ui.fontFixed
+            font.weight: root.agentHighlighted(modelData) ? Style.fontWeightBold : Font.Normal
             pointSize: root.barFontSize
             color: Color.mOnSurface
           }

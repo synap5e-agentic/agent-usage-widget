@@ -179,7 +179,11 @@ class UsageRequestHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path == "/api/current":
             try:
-                payload = self.client.build_current_contract(history_days=self.history_days, sources=self.app_config.sources)
+                payload = self.client.build_current_contract(
+                    history_days=self.history_days,
+                    sources=self.app_config.sources,
+                    frontend=self.app_config.frontend,
+                )
             except Exception as exc:
                 self._write_error(503, f"database unavailable: {exc}")
                 return
