@@ -166,7 +166,15 @@ scripts/grab_provider_credentials.py
 scripts/grab_provider_credentials.py --target claude --target cursor
 ```
 
-Log in inside the launched Chrome profile and visit the usage page that opens; the script self-terminates once it has each requested target's cookie (and Authorization header for Codex). The Chrome profile is persisted under `$XDG_STATE_HOME/agent-usage-widget/grab-chrome-profile/` so subsequent runs reuse any still-valid logins; pass `--reset-profile` to wipe it. If Chrome is not installed, the script prints proxy details for routing any browser through `mitmdump` manually (visit `http://mitm.it/` once connected to install the CA).
+Log in inside the launched Chrome profile and visit the usage page that opens; the script self-terminates once it has each requested target's cookie (and Authorization header for Codex). The Chrome profile is persisted under `$XDG_STATE_HOME/agent-usage-widget/grab-chrome-profile/` so subsequent runs reuse any still-valid logins; pass `--reset-profile` to wipe it. Chrome is intentionally left running after capture so it can flush cookies on its normal exit — close it when you're done to keep the session for next time. If Chrome is not installed, the script prints proxy details for routing any browser through `mitmdump` manually (visit `http://mitm.it/` once connected to install the CA).
+
+To write captures straight into the existing config without copy-paste, pass `--write <source_id>` (repeatable). The named source must already exist in `config.toml` with a `provider` field; the script replaces its `[sources.<source_id>.auth]` table and leaves the rest untouched.
+
+```bash
+scripts/grab_provider_credentials.py --write claude_personal --write codex_main
+```
+
+A timestamped backup is dropped next to `config.toml` (`config.toml.bak.<unix-ts>`). Two `--write` source IDs that map to the same provider are rejected — capture one, close Chrome with `--reset-profile`, then capture the next.
 
 If you'd rather copy by hand, the manual recipe per provider is below. Open Chromium / Firefox DevTools (`F12`), log in to the provider, and capture from the **Network** tab.
 

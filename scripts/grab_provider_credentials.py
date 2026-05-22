@@ -32,6 +32,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 from pathlib import Path
 
 PROVIDERS: dict[str, dict[str, object]] = {
@@ -131,14 +132,114 @@ def _write_chrome_preferences(profile_dir: Path) -> None:
     )
 
 
-def _format_toml(provider: str, capture: dict[str, str]) -> str:
-    section = PROVIDERS[provider]["toml_section"]
-    lines = [f"[sources.{section}.auth]"]
-    for key in ("authorization", "cookie", "organization_id"):
+_AUTH_FIELD_ORDER = ("authorization", "cookie", "organization_id")
+
+
+def _toml_string(value: str) -> str:
+    # Prefer TOML literal string (no escape processing) when possible.
+    if "'" not in value and "\n" not in value and "\r" not in value:
+        return f"'{value}'"
+    escaped = (
+        value.replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+        .replace("\t", "\\t")
+    )
+    return f'"{escaped}"'
+
+
+def _format_toml(source_id: str, capture: dict[str, str]) -> str:
+    lines = [f"[sources.{source_id}.auth]"]
+    for key in _AUTH_FIELD_ORDER:
         if key in capture:
-            value = capture[key].replace("\\", "\\\\").replace("'", "\\'")
-            lines.append(f"{key} = '{value}'")
+            lines.append(f"{key} = {_toml_string(capture[key])}")
     return "\n".join(lines)
+
+
+def _replace_auth_section(text: str, source_id: str, fields: dict[str, str]) -> str:
+    """Rewrite the `[sources.<source_id>.auth]` table with the given fields.
+
+    Replaces all lines between the header and the next `[...]` header.
+    If the section doesn't exist, appends it at end-of-file. Other sections
+    (label, frontend, etc.) are untouched.
+    """
+    header = f"[sources.{source_id}.auth]"
+    body = [f"{key} = {_toml_string(fields[key])}" for key in _AUTH_FIELD_ORDER if key in fields]
+    lines = text.splitlines()
+    out: list[str] = []
+    i = 0
+    found = False
+    while i < len(lines):
+        if lines[i].strip() == header:
+            found = True
+            out.append(lines[i])
+            i += 1
+            while i < len(lines) and not lines[i].lstrip().startswith("["):
+                i += 1
+            out.extend(body)
+            if i < len(lines):
+                out.append("")
+            continue
+        out.append(lines[i])
+        i += 1
+
+    if not found:
+        if out and out[-1].strip():
+            out.append("")
+        out.append(header)
+        out.extend(body)
+
+    trailing_newline = "\n" if text.endswith("\n") or not text else ""
+    return "\n".join(out) + trailing_newline
+
+
+def _load_write_mapping(config_path: Path, write_ids: list[str]) -> dict[str, str]:
+    """Return {source_id: provider} for each --write target.
+
+    Validates that each source exists in config.toml with a supported provider
+    and that no two source IDs share a provider (one capture per Chrome session).
+    """
+    if not config_path.exists():
+        raise SystemExit(f"[grab] config file not found: {config_path}")
+    parsed = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    sources = parsed.get("sources")
+    if not isinstance(sources, dict):
+        raise SystemExit(f"[grab] no [sources.*] tables in {config_path}")
+    mapping: dict[str, str] = {}
+    by_provider: dict[str, str] = {}
+    for source_id in write_ids:
+        source = sources.get(source_id)
+        if not isinstance(source, dict):
+            raise SystemExit(f"[grab] [sources.{source_id}] not found in {config_path}")
+        provider = str(source.get("provider") or "").strip().lower()
+        if provider not in PROVIDERS:
+            raise SystemExit(
+                f"[grab] [sources.{source_id}].provider must be one of: {', '.join(sorted(PROVIDERS))} "
+                f"(got {provider!r})"
+            )
+        if provider in by_provider:
+            raise SystemExit(
+                f"[grab] sources {by_provider[provider]!r} and {source_id!r} both want provider {provider!r}; "
+                "rerun the script with --reset-profile for the second one"
+            )
+        by_provider[provider] = source_id
+        mapping[source_id] = provider
+    return mapping
+
+
+def _write_auth_to_config(config_path: Path, source_id: str, fields: dict[str, str]) -> Path:
+    """Replace [sources.<source_id>.auth] in `config_path`. Returns the backup path."""
+    original = config_path.read_text(encoding="utf-8")
+    backup = config_path.with_suffix(config_path.suffix + f".bak.{int(time.time())}")
+    backup.write_bytes(config_path.read_bytes())
+    backup.chmod(0o600)
+    new_text = _replace_auth_section(original, source_id, fields)
+    tmp = config_path.with_suffix(config_path.suffix + ".tmp")
+    tmp.write_text(new_text, encoding="utf-8")
+    tmp.chmod(0o600)
+    tmp.replace(config_path)
+    return backup
 
 
 def _wait_for_listening(port: int, timeout: float) -> bool:
@@ -181,7 +282,14 @@ def _launch_chrome(chrome_path: str, profile_dir: Path, port: int, urls: list[st
         "--no-default-browser-check",
         *urls,
     ]
-    return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # start_new_session so Chrome survives our exit and gets a clean shutdown
+    # when the user closes the window — that's when cookies actually flush to disk.
+    return subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
 
 
 def _collect_captures(capture_dir: Path, targets: list[str], timeout: float) -> dict[str, dict[str, str]]:
@@ -231,9 +339,41 @@ def main() -> int:
         action="store_true",
         help="Discard the persistent Chrome profile before launching (forces a fresh login).",
     )
+    parser.add_argument(
+        "--write",
+        action="append",
+        default=[],
+        metavar="SOURCE_ID",
+        help=(
+            "Write captured credentials into [sources.<SOURCE_ID>.auth] of config.toml. "
+            "Repeatable; the target source must already exist with a `provider` field. "
+            "Suppresses raw TOML on stdout for sources that are written."
+        ),
+    )
+    default_config = os.environ.get("AGENT_USAGE_CONFIG_FILE") or str(
+        Path.home() / ".config" / "agent-usage-widget" / "config.toml"
+    )
+    parser.add_argument(
+        "--config",
+        default=default_config,
+        help=f"Path to config.toml (default {default_config}).",
+    )
     args = parser.parse_args()
 
-    targets = args.target or sorted(PROVIDERS)
+    config_path = Path(args.config).expanduser()
+    write_mapping: dict[str, str] = {}
+    if args.write:
+        write_mapping = _load_write_mapping(config_path, args.write)
+
+    write_providers = set(write_mapping.values())
+    target_providers = set(args.target or [])
+    if not target_providers and not write_providers:
+        targets = sorted(PROVIDERS)
+    else:
+        targets = sorted(target_providers | write_providers)
+
+    # Reverse map: provider -> source_id (for writing back)
+    provider_to_source = {provider: source_id for source_id, provider in write_mapping.items()}
 
     port = _pick_port()
     capture_dir = Path(tempfile.mkdtemp(prefix="agent-usage-grab-", dir=_xdg_runtime_dir()))
@@ -280,12 +420,9 @@ def main() -> int:
         if cleanup_done:
             return
         cleanup_done = True
-        if chrome_proc and chrome_proc.poll() is None:
-            chrome_proc.terminate()
-            try:
-                chrome_proc.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                chrome_proc.kill()
+        # Intentionally do NOT terminate Chrome — leave it running so the user can
+        # finish (or just so Chrome flushes cookies on its own exit). Chrome was
+        # launched in its own session and will outlive this script.
         if mitm.poll() is None:
             mitm.terminate()
             try:
@@ -329,17 +466,43 @@ def main() -> int:
         sys.stderr.write("[grab] no captures collected before exit\n")
         return 2
 
-    print()
-    print("# Paste into ~/.config/agent-usage-widget/config.toml")
-    print("# (one [sources.<id>] block per provider; section name is the source id)")
-    print()
+    printable: list[tuple[str, dict[str, str]]] = []
+    written: list[tuple[str, list[str]]] = []
+
     for target in targets:
-        if target in captures:
-            print(_format_toml(target, captures[target]))
+        capture = captures.get(target)
+        if capture is None:
+            sys.stderr.write(f"[grab] {target}: NOT CAPTURED\n")
+            continue
+        source_id = provider_to_source.get(target)
+        if source_id is None:
+            printable.append((target, capture))
+            continue
+        try:
+            backup = _write_auth_to_config(config_path, source_id, capture)
+        except OSError as exc:
+            sys.stderr.write(f"[grab] failed to write {source_id}: {exc}\n")
+            printable.append((target, capture))
+            continue
+        written.append((source_id, sorted(capture.keys())))
+        sys.stderr.write(
+            f"[grab] wrote sources.{source_id}.auth to {config_path} "
+            f"({', '.join(sorted(capture.keys()))}); backup at {backup}\n"
+        )
+
+    if printable:
+        print()
+        print("# Paste into ~/.config/agent-usage-widget/config.toml")
+        print("# (one [sources.<id>] block per provider; section name is the source id)")
+        print()
+        for provider, capture in printable:
+            print(_format_toml(provider, capture))
             print()
-        else:
-            print(f"# {target}: NOT CAPTURED")
-            print()
+
+    if chrome_proc and chrome_proc.poll() is None:
+        sys.stderr.write(
+            "[grab] Chrome left open — close it normally so logins flush to the persistent profile\n"
+        )
 
     missing = [t for t in targets if t not in captures]
     return 0 if not missing else 3
