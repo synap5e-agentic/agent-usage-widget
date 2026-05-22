@@ -154,7 +154,21 @@ Open the Noctalia settings UI, find the bar section you want the widget in (left
 
 ## Getting credentials
 
-All three providers authenticate by replaying cookies and tokens copied from a logged-in browser session. Open Chromium / Firefox DevTools (`F12`), log in to the provider, and capture from the **Network** tab.
+All three providers authenticate by replaying cookies and tokens copied from a logged-in browser session.
+
+The fast path is `scripts/grab_provider_credentials.py`: it self-launches `mitmdump`, opens a fresh red-themed Chrome pointed at the proxy, and prints ready-to-paste TOML for each provider as soon as it captures the relevant traffic.
+
+```bash
+# all three providers
+scripts/grab_provider_credentials.py
+
+# only the ones you want
+scripts/grab_provider_credentials.py --target claude --target cursor
+```
+
+Log in inside the launched Chrome profile and visit the usage page that opens; the script self-terminates once it has each requested target's cookie (and Authorization header for Codex). The Chrome profile is persisted under `$XDG_STATE_HOME/agent-usage-widget/grab-chrome-profile/` so subsequent runs reuse any still-valid logins; pass `--reset-profile` to wipe it. If Chrome is not installed, the script prints proxy details for routing any browser through `mitmdump` manually (visit `http://mitm.it/` once connected to install the CA).
+
+If you'd rather copy by hand, the manual recipe per provider is below. Open Chromium / Firefox DevTools (`F12`), log in to the provider, and capture from the **Network** tab.
 
 ### Claude
 
