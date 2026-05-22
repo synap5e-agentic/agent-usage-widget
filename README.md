@@ -24,7 +24,7 @@ This repo includes a poller, a local HTTP service, a reusable QML UI layer, and 
 | `qml/` | reusable QML components |
 | `noctalia_plugin/` | Noctalia / Quickshell adapter layer |
 | `systemd/` | user service and timer units |
-| `scripts/` | QML setup, lint, test, and visual-regression helpers |
+| `scripts/` | QML setup, lint, test, visual-regression helpers, and the `grab_provider_credentials.py` mitmproxy helper for capturing auth |
 | `tests/python/` | backend tests |
 | `qml/tests/` | QML and visual regression tests |
 
@@ -77,11 +77,7 @@ psql "postgresql://agent_usage:$PG_PASSWORD@127.0.0.1:5432/agent_usage" < poller
 
 This is idempotent. Re-run it any time after a `git pull` to apply schema migrations.
 
-### 4. Get provider credentials
-
-See [Getting credentials](#getting-credentials) for per-provider DevTools steps. You need one cookie or token per source you intend to enable.
-
-### 5. Write your `config.toml`
+### 4. Write your `config.toml`
 
 ```bash
 mkdir -p ~/.config/agent-usage-widget
@@ -89,7 +85,7 @@ cp poller/config.toml.example ~/.config/agent-usage-widget/config.toml
 chmod 600 ~/.config/agent-usage-widget/config.toml
 ```
 
-Edit it. A minimal one-source example (replace `<PG_PASSWORD>` with the value from step 2):
+Edit it. A minimal example (paste the DSN from step 2 into `[storage].db_dsn` and leave `[sources.<id>.auth]` empty — step 5 fills it in):
 
 ```toml
 [service]
@@ -102,34 +98,24 @@ default_interval_seconds = 60
 [storage]
 db_dsn = "postgresql://agent_usage:<PG_PASSWORD>@127.0.0.1:5432/agent_usage"
 
-[frontend]
-columns = 3
-
 [sources.personal]
 provider = "claude"
 label = "Claude Personal"
 enabled = true
-frontend_visible = true
-
-[sources.personal.frontend]
-order = 10
-short_label = "CP"
-show_metrics = ["seven_day", "five_hour", "extra_usage"]
-show_graphs = ["seven_day", "five_hour"]
-highlight_metric = "extra_usage"
-highlight_window_minutes = 34
 
 [sources.personal.auth]
-cookie = "sessionKey=...; lastActiveOrg=...; anthropic-device-id=...; ajs_anonymous_id=..."
+# Filled in by `grab_provider_credentials.py --write personal` (step 5).
 ```
 
-A few notes on the schema:
+A few notes:
 
-- Source table names like `personal` become stable `source_id` values in the service contract; keep them ASCII-friendly.
-- `label` defaults to the source id; `enabled` and `frontend_visible` default to `true`; `interval_seconds` defaults to `poller.default_interval_seconds`.
-- The bundled `config.toml.example` ships every source with `enabled = false` so a fresh install doesn't poll empty credentials. Flip the ones you want on.
+- Source table names (`personal` above) become stable `source_id` values; keep them ASCII-friendly. `label` defaults to the source id; `enabled` and `frontend_visible` default to `true`; `interval_seconds` defaults to `poller.default_interval_seconds`.
 - You can configure multiple sources for the same provider (e.g. personal + work Claude) by giving each its own table name and cookie.
-- `[frontend].columns` controls panel columns. `[sources.<name>.frontend]` controls per-source order, bar short label, visible metrics, graph selection, and the highlight metric. Claude `extra_usage` is a currency metric; the default policy shows it and highlights the bar when it increased in the last 34 minutes.
+- The bundled `config.toml.example` ships every source with `enabled = false` and shows the full per-source frontend policy (`order`, `short_label`, `show_metrics`, `show_graphs`, `highlight_metric`, etc.) plus `[frontend].columns` for panel layout. Flip what you want on and copy over the frontend blocks you care about.
+
+### 5. Capture provider credentials
+
+See [Getting credentials](#getting-credentials). The fast path is `scripts/grab_provider_credentials.py --write <source_id>`, which writes captured cookies/tokens directly into the `[sources.<source_id>.auth]` table you stubbed out in step 4. A manual DevTools recipe is documented there too as a fallback — use it if you don't want to run a helper that proxies your browser, or if your environment doesn't have Chrome.
 
 ### 6. Install symlinks, the Noctalia plugin, and the systemd units
 
@@ -154,63 +140,67 @@ Open the Noctalia settings UI, find the bar section you want the widget in (left
 
 ## Getting credentials
 
-All three providers authenticate by replaying cookies and tokens copied from a logged-in browser session.
+All three providers authenticate by replaying cookies (and, for Codex, an `Authorization: Bearer` token plus an `oai-session-id` request header) copied from a logged-in browser session.
 
-The fast path is `scripts/grab_provider_credentials.py`: it self-launches `mitmdump`, opens a fresh red-themed Chrome pointed at the proxy, and prints ready-to-paste TOML for each provider as soon as it captures the relevant traffic.
+### Fast path: `grab_provider_credentials.py`
+
+`scripts/grab_provider_credentials.py` is a self-contained mitmproxy helper. It picks a free port, launches `mitmdump` with itself as the addon, opens a red-themed Chrome session pointed at the proxy, and captures the relevant traffic as you log in.
 
 ```bash
-# all three providers
+# Capture all three providers and print TOML to stdout
 scripts/grab_provider_credentials.py
 
-# only the ones you want
+# Write straight into specific [sources.<id>.auth] tables (recommended)
+scripts/grab_provider_credentials.py --write personal --write work --write codex --write cursor
+
+# Capture without writing (review / copy-paste yourself)
 scripts/grab_provider_credentials.py --target claude --target cursor
 ```
 
-Log in inside the launched Chrome profile and visit the usage page that opens; the script self-terminates once it has each requested target's cookie (and Authorization header for Codex). The Chrome profile is persisted under `$XDG_STATE_HOME/agent-usage-widget/grab-chrome-profile/` so subsequent runs reuse any still-valid logins; pass `--reset-profile` to wipe it. Chrome is sent SIGTERM with a 15s grace period on success so cookies actually flush to disk before exit. If Chrome is not installed, the script prints proxy details for routing any browser through `mitmdump` manually (visit `http://mitm.it/` once connected to install the CA).
+Behaviour:
 
-To write captures straight into the existing config without copy-paste, pass `--write <source_id>` (repeatable). The named source must already exist in `config.toml` with a `provider` field; the script replaces its `[sources.<source_id>.auth]` table and leaves the rest untouched.
+- **`--write <source_id>`** is repeatable. Each named source must already exist in `config.toml` with a `provider` field; the script rewrites just that source's `[sources.<source_id>.auth]` block and leaves everything else (label, frontend policy, sibling sources) untouched. A timestamped backup is dropped next to the file (`config.toml.bak.<unix-ts>`). Two `--write` IDs mapping to the same provider are rejected (one Chrome session can hold only one account per provider — use `--reset-profile` and run again for the second account).
+- **Chrome profile is persistent** under `$XDG_STATE_HOME/agent-usage-widget/grab-chrome-profile/`, so re-running picks up still-valid logins. Pass `--reset-profile` to wipe it and start fresh (useful when switching accounts, e.g. free-tier ↔ paid Codex).
+- **Login redirects**: if a provider redirects you away from the usage page after login, the launcher prints a list of the original URLs — paste the one you need back into the address bar. ChatGPT in particular tends to drop the original URL on its OAuth round-trip.
+- **No Chrome?** The script prints proxy details so you can route any browser through `mitmdump` manually; visit http://mitm.it/ once connected to install the CA cert.
+- On capture completion the script SIGTERMs Chrome with a 15s grace period so cookies actually flush to disk before exit.
+
+After a successful run, force an immediate poll and verify:
 
 ```bash
-scripts/grab_provider_credentials.py --write claude_personal --write codex_main
+agent-usage-poll --force --source <source_id>
+curl -s http://127.0.0.1:8785/api/current | jq '.agents[] | {source_id, status: .status.state, summary: .summary.value}'
 ```
-
-A timestamped backup is dropped next to `config.toml` (`config.toml.bak.<unix-ts>`). Two `--write` source IDs that map to the same provider are rejected — capture one, close Chrome with `--reset-profile`, then capture the next.
-
-If you'd rather copy by hand, the manual recipe per provider is below. Open Chromium / Firefox DevTools (`F12`), log in to the provider, and capture from the **Network** tab.
-
-### Claude
-
-1. Log in to https://claude.ai/.
-2. DevTools → Network → reload the page.
-3. Click any request to `claude.ai` (e.g. the usage endpoint at `/api/organizations/.../usage` if you visit Settings → Usage).
-4. Under **Request Headers**, copy the entire `Cookie:` value.
-5. Paste it into `[sources.<name>.auth].cookie`.
-
-The poller extracts `sessionKey`, `lastActiveOrg`, `anthropic-device-id`, and `ajs_anonymous_id` from the cookie automatically. You can also set them individually under `[sources.<name>.auth]` as `session_key`, `organization_id`, `device_id`, `anonymous_id` if your cookie is missing one of them.
-
-### Codex (ChatGPT)
-
-1. Log in to https://chatgpt.com/.
-2. Visit https://chatgpt.com/codex/cloud/settings/analytics so a usage request fires.
-3. DevTools → Network → find the request to `/backend-api/wham/usage`.
-4. Under **Request Headers**:
-   - Copy the full `Authorization:` value (starts with `Bearer eyJ…`) into `[sources.<name>.auth].authorization`.
-   - Copy the full `Cookie:` value into `[sources.<name>.auth].cookie`.
-
-The poller derives `oai-did` and `oai-session-id` from the cookie. If your cookie is missing them you can supply `device_id` / `session_id` (and optionally `oai_session_id` for the header) directly under `[sources.<name>.auth]`.
-
-### Cursor
-
-1. Log in to https://cursor.com/.
-2. Visit https://cursor.com/dashboard/billing so the usage endpoint fires.
-3. DevTools → Network → find any request to `cursor.com/api/...`.
-4. Under **Request Headers**, copy the entire `Cookie:` value into `[sources.<name>.auth].cookie`.
 
 ### Refreshing credentials
 
-Provider auth here is based on browser session tokens. They expire (Codex bearer tokens within hours, Claude/Cursor session cookies after days or weeks) and have to be refreshed manually by repeating the steps above. The service surfaces stale / expired sign-in state through the `status` field on each agent, but it cannot renew credentials for you. This is the main UX limitation of the current design.
+Provider session tokens expire (Codex bearer tokens within hours, Claude/Cursor session cookies after days or weeks). The poller surfaces stale / expired state via `status.state == "error"` on each agent. To rotate, re-run the grab script with `--write`:
 
-Legacy `.env` configuration is still read as a fallback when no TOML sources are configured. If both files exist, `config.toml` controls service settings and sources; explicit CLI overrides still win.
+```bash
+scripts/grab_provider_credentials.py --write <source_id>
+```
+
+The persistent Chrome profile usually means you only need to re-log-in once per provider per browser-session-expiry; the next rotation just re-captures from the already-logged-in session.
+
+### Manual fallback (DevTools)
+
+If you'd rather skip the proxy entirely, copy the required pieces by hand from your browser's DevTools (`F12`) → Network tab.
+
+**Claude** — Log in to https://claude.ai/, open Settings → Usage so `/api/organizations/<org>/usage` fires, click that request, and copy the full `Cookie:` value into `[sources.<id>.auth].cookie`. The poller extracts `sessionKey`, `lastActiveOrg`, `anthropic-device-id`, and `ajs_anonymous_id` from the cookie. If your cookie is missing `lastActiveOrg`, set `organization_id = "..."` alongside the cookie (the org id appears in the request URL).
+
+**Codex (ChatGPT)** — Log in to https://chatgpt.com/, navigate to https://chatgpt.com/codex/cloud/settings/usage so `/backend-api/wham/usage` fires, and from that request copy:
+
+- `Authorization:` value (starts with `Bearer eyJ…`) → `[sources.<id>.auth].authorization`
+- `Cookie:` value → `[sources.<id>.auth].cookie`
+- `oai-session-id:` **request header** (not a cookie!) → `[sources.<id>.auth].session_id`
+
+The poller derives `oai-did` from the cookie. `oai-session-id` lives only in the request header, so it must be set explicitly.
+
+**Cursor** — Log in to https://cursor.com/, visit https://cursor.com/dashboard/billing so `/api/usage-summary` fires, and copy the full `Cookie:` value into `[sources.<id>.auth].cookie`.
+
+### Legacy `.env`
+
+The legacy `.env` configuration is still read as a fallback when no TOML sources are configured. If both files exist, `config.toml` controls service settings and sources; explicit CLI overrides still win.
 
 ## API
 
