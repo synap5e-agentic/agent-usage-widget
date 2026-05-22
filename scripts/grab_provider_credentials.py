@@ -428,8 +428,15 @@ def main() -> int:
         if cleanup_done:
             return
         cleanup_done = True
-        # Tear-down path used for failures (timeout, signal). Happy-path success
-        # delegates Chrome + mitm shutdown to a detached watchdog instead.
+        # SIGTERM Chrome first and give it a generous grace period — Chrome
+        # buffers cookie writes for a few seconds and we need sessionKey etc.
+        # to actually land on disk before we exit.
+        if chrome_proc is not None and chrome_proc.poll() is None:
+            chrome_proc.terminate()
+            try:
+                chrome_proc.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                chrome_proc.kill()
         if mitm.poll() is None:
             mitm.terminate()
             try:
@@ -464,46 +471,12 @@ def main() -> int:
             _print_browser_instructions(port, urls, cert_path)
 
         captures = _collect_captures(capture_dir, targets, timeout=args.timeout)
-    except BaseException:
+    finally:
         cleanup()
-        raise
 
     if not captures:
-        cleanup()
         sys.stderr.write("[grab] no captures collected before exit\n")
         return 2
-
-    # Happy path: keep mitm + Chrome alive so the user can keep browsing through
-    # the proxy. A detached watchdog kills mitm + wipes capture_dir once Chrome
-    # exits. Signal handlers are removed so a stray SIGTERM during our own exit
-    # doesn't tear mitm down prematurely.
-    signal.signal(signal.SIGINT, signal.SIG_DFL)
-    signal.signal(signal.SIGTERM, signal.SIG_DFL)
-    cleanup_done = True  # don't let any later code path re-enter cleanup()
-    if chrome_proc is not None and mitm.poll() is None:
-        subprocess.Popen(
-            [
-                "bash",
-                "-c",
-                (
-                    f"while kill -0 {chrome_proc.pid} 2>/dev/null; do sleep 5; done; "
-                    f"kill {mitm.pid} 2>/dev/null; "
-                    f"rm -rf {capture_dir}"
-                ),
-            ],
-            start_new_session=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-    else:
-        # No Chrome to anchor mitm's lifetime — just tear it down now.
-        if mitm.poll() is None:
-            mitm.terminate()
-            try:
-                mitm.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                mitm.kill()
-        shutil.rmtree(capture_dir, ignore_errors=True)
 
     printable: list[tuple[str, dict[str, str]]] = []
     written: list[tuple[str, list[str]]] = []
@@ -537,12 +510,6 @@ def main() -> int:
         for provider, capture in printable:
             print(_format_toml(provider, capture))
             print()
-
-    if chrome_proc and chrome_proc.poll() is None:
-        sys.stderr.write(
-            f"[grab] Chrome left open through the mitm proxy (pid {chrome_proc.pid}); "
-            "close it normally to flush cookies and tear down mitm\n"
-        )
 
     missing = [t for t in targets if t not in captures]
     return 0 if not missing else 3
@@ -622,10 +589,9 @@ class CredentialCapture:
             out = self.capture_dir / f"{target_id}.json"
             out.write_text(json.dumps(cap, indent=2))
             ctx.log.info(f"[grab] captured {target_id} from {host}{path}")
-            # Don't shut down mitmproxy on completion — the launcher detects the
-            # capture via the JSON files and arranges for mitm to outlive itself
-            # so Chrome can keep browsing through the proxy until the user closes
-            # the window. mitm is reaped by a watchdog tied to Chrome's PID.
+            if self.captured >= set(self.targets):
+                ctx.log.info("[grab] all targets captured, shutting down")
+                ctx.master.shutdown()
             return
 
 
