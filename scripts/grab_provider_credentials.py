@@ -46,7 +46,7 @@ PROVIDERS: dict[str, dict[str, object]] = {
     },
     "codex": {
         "label": "Codex (chatgpt.com)",
-        "open_urls": ["https://chatgpt.com/codex/cloud/settings/analytics#usage"],
+        "open_urls": ["https://chatgpt.com/codex/cloud/settings/usage"],
         "match_host_suffix": "chatgpt.com",
         "match_path_prefix": "/backend-api/wham/",
         "needs": ("cookie", "authorization", "session_id"),
@@ -464,6 +464,10 @@ def main() -> int:
                 f"at {chrome_profile}\n"
             )
             sys.stderr.write("[grab] log in to each provider; the script self-terminates on capture\n")
+            sys.stderr.write("[grab] if a provider redirects you away from its usage page after login, paste:\n")
+            for target_id in targets:
+                for url in PROVIDERS[target_id]["open_urls"]:  # type: ignore[index]
+                    sys.stderr.write(f"[grab]   {target_id}: {url}\n")
             sys.stderr.flush()
             chrome_proc = _launch_chrome(chrome_path, chrome_profile, port, urls)
         else:
