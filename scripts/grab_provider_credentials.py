@@ -46,10 +46,11 @@ PROVIDERS: dict[str, dict[str, object]] = {
     },
     "codex": {
         "label": "Codex (chatgpt.com)",
-        "open_urls": ["https://chatgpt.com/codex/cloud/settings/analytics"],
+        "open_urls": ["https://chatgpt.com/codex/cloud/settings/analytics#usage"],
         "match_host_suffix": "chatgpt.com",
         "match_path_prefix": "/backend-api/wham/",
-        "needs": ("cookie", "authorization"),
+        "needs": ("cookie", "authorization", "session_id"),
+        "capture_headers": {"oai-session-id": "session_id"},
         "toml_section": "codex",
     },
     "cursor": {
@@ -132,7 +133,7 @@ def _write_chrome_preferences(profile_dir: Path) -> None:
     )
 
 
-_AUTH_FIELD_ORDER = ("authorization", "cookie", "organization_id")
+_AUTH_FIELD_ORDER = ("authorization", "cookie", "organization_id", "session_id")
 
 
 def _toml_string(value: str) -> str:
@@ -565,6 +566,11 @@ class CredentialCapture:
                 auth = flow.request.headers.get("Authorization", "")
                 if auth.lower().startswith("bearer "):
                     cap["authorization"] = auth
+            capture_headers = target.get("capture_headers") or {}
+            for header_name, toml_field in capture_headers.items():
+                value = flow.request.headers.get(header_name, "")
+                if value:
+                    cap[toml_field] = value
             if target_id == "claude":
                 import re
 
