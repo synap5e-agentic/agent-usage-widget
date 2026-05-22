@@ -23,7 +23,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 DEFAULT_CONFIG_FILE = Path.home() / ".config" / "agent-usage-widget" / "config.toml"
 DEFAULT_ENV_FILE = Path.home() / ".config" / "agent-usage-widget" / ".env"
-DEFAULT_DB_DSN = "postgresql://agent_usage:agent_usage@127.0.0.1:5433/agent_usage"
+DEFAULT_DB_DSN = "postgresql://agent_usage:agent_usage@127.0.0.1:5432/agent_usage"
 DEFAULT_SERVICE_HOST = "127.0.0.1"
 DEFAULT_SERVICE_PORT = 8785
 DEFAULT_POLL_INTERVAL_SECONDS = 60

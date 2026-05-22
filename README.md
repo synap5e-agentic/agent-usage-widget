@@ -30,20 +30,58 @@ This repo includes a poller, a local HTTP service, a reusable QML UI layer, and 
 
 ## Requirements
 
-- `python3`
-- `psql`
-- PostgreSQL reachable via `AGENT_USAGE_DB_DSN`
+- Linux with systemd user services
+- `python3`, `psql` (the PostgreSQL client)
+- A PostgreSQL server reachable from this machine (recipe below)
 - Noctalia / Quickshell for the UI
+- A logged-in browser session for each provider you want to track
 
 ## Quick Start
 
-1. Install the symlinks, plugin, and systemd units:
+The steps below get the backend running before `install.sh` enables the systemd units, so the very first poll cycle has a schema, credentials, and a database to talk to.
+
+### 1. Clone the repo
 
 ```bash
-./install.sh --restart
+git clone https://github.com/synap5e-agentic/agent-usage-widget.git
+cd agent-usage-widget
 ```
 
-2. If the install script did not already create it, copy the sample config:
+All subsequent commands assume you are at the repo root.
+
+### 2. Install PostgreSQL and create the role + database
+
+Install and start PostgreSQL with your distro's package manager (`pacman -S postgresql`, `apt install postgresql`, `dnf install postgresql-server`, etc.) and initialize the cluster per your distro's instructions.
+
+Generate a random password and create the role + database. Save the password — you'll paste it into `config.toml` in step 5.
+
+```bash
+PG_PASSWORD=$(openssl rand -hex 24)
+sudo -u postgres psql <<SQL
+CREATE ROLE agent_usage WITH LOGIN PASSWORD '$PG_PASSWORD';
+CREATE DATABASE agent_usage OWNER agent_usage;
+SQL
+echo "Save this DSN for config.toml step 5:"
+echo "postgresql://agent_usage:$PG_PASSWORD@127.0.0.1:5432/agent_usage"
+```
+
+If your PostgreSQL listens on a non-default port or host, adjust the DSN accordingly. The default expects `127.0.0.1:5432`.
+
+### 3. Bootstrap the schema
+
+Using the DSN you just generated:
+
+```bash
+psql "postgresql://agent_usage:$PG_PASSWORD@127.0.0.1:5432/agent_usage" < poller/schema.sql
+```
+
+This is idempotent. Re-run it any time after a `git pull` to apply schema migrations.
+
+### 4. Get provider credentials
+
+See [Getting credentials](#getting-credentials) for per-provider DevTools steps. You need one cookie or token per source you intend to enable.
+
+### 5. Write your `config.toml`
 
 ```bash
 mkdir -p ~/.config/agent-usage-widget
@@ -51,7 +89,7 @@ cp poller/config.toml.example ~/.config/agent-usage-widget/config.toml
 chmod 600 ~/.config/agent-usage-widget/config.toml
 ```
 
-3. Configure each provider identity as a source:
+Edit it. A minimal one-source example (replace `<PG_PASSWORD>` with the value from step 2):
 
 ```toml
 [service]
@@ -61,12 +99,16 @@ port = 8785
 [poller]
 default_interval_seconds = 60
 
+[storage]
+db_dsn = "postgresql://agent_usage:<PG_PASSWORD>@127.0.0.1:5432/agent_usage"
+
 [frontend]
 columns = 3
 
 [sources.personal]
 provider = "claude"
 label = "Claude Personal"
+enabled = true
 frontend_visible = true
 
 [sources.personal.frontend]
@@ -78,64 +120,75 @@ highlight_metric = "extra_usage"
 highlight_window_minutes = 34
 
 [sources.personal.auth]
-cookie = "..."
-
-[sources.work]
-provider = "claude"
-label = "Claude Work"
-frontend_visible = true
-interval_seconds = 1800
-
-[sources.work.frontend]
-order = 20
-short_label = "CW"
-show_metrics = ["seven_day", "five_hour", "extra_usage"]
-show_graphs = ["seven_day", "five_hour"]
-highlight_metric = "extra_usage"
-highlight_window_minutes = 34
-
-[sources.work.auth]
-cookie = "..."
-
-[sources.codex]
-provider = "codex"
-label = "Codex"
-frontend_visible = true
-
-[sources.codex.frontend]
-order = 30
-short_label = "Cx"
-show_metrics = ["secondary_window", "primary_window"]
-show_graphs = ["secondary_window", "primary_window"]
-
-[sources.codex.auth]
-authorization = "Bearer ..."
-cookie = "..."
+cookie = "sessionKey=...; lastActiveOrg=...; anthropic-device-id=...; ajs_anonymous_id=..."
 ```
 
-`~/.config/agent-usage-widget/config.toml` is the primary runtime config. Source table names such as `personal` and `work` become stable `source_id` values in the service contract. `label` defaults to the source id, `frontend_visible` and `enabled` default to `true`, and `interval_seconds` defaults to `poller.default_interval_seconds`.
+A few notes on the schema:
 
-Frontend policy is also read from TOML and returned by `/api/current`. `[frontend].columns` controls panel columns, and `[sources.<name>.frontend]` controls source order, bar short labels, visible metrics, graph selection, and the metric used for recent-increase highlighting. Claude `extra_usage` is normalized as a currency metric; the default Claude policy shows it and highlights the bar when it increased in the last 34 minutes.
+- Source table names like `personal` become stable `source_id` values in the service contract; keep them ASCII-friendly.
+- `label` defaults to the source id; `enabled` and `frontend_visible` default to `true`; `interval_seconds` defaults to `poller.default_interval_seconds`.
+- The bundled `config.toml.example` ships every source with `enabled = false` so a fresh install doesn't poll empty credentials. Flip the ones you want on.
+- You can configure multiple sources for the same provider (e.g. personal + work Claude) by giving each its own table name and cookie.
+- `[frontend].columns` controls panel columns. `[sources.<name>.frontend]` controls per-source order, bar short label, visible metrics, graph selection, and the highlight metric. Claude `extra_usage` is a currency metric; the default policy shows it and highlights the bar when it increased in the last 34 minutes.
 
-The checked-in `poller/config.toml.example` disables placeholder sources so a fresh install does not poll empty credentials. Set `enabled = true` or remove that line after filling in auth.
+### 6. Install symlinks, the Noctalia plugin, and the systemd units
+
+```bash
+./install.sh --restart
+```
+
+This step links `agent-usage-poll` and `agent-usage-service` into `~/bin/`, links the systemd unit files into `~/.config/systemd/user/`, links the Noctalia plugin into `~/.config/noctalia/plugins/agent-usage/`, registers the plugin in `~/.config/noctalia/plugins.json`, and enables + starts the systemd timer and service. `--restart` also restarts Noctalia so the new plugin loads immediately.
+
+### 7. Verify the backend
+
+```bash
+systemctl --user status agent-usage-poll.service agent-usage-service.service
+curl -s http://127.0.0.1:8785/api/current | jq '.agents[] | {source_id, label, status: .status.state, summary: .summary.value}'
+```
+
+Each enabled source should show up with `status: "ok"` once the poller has fired at least once. If a source is `error`, the `status.message` field tells you what went wrong (most commonly an expired cookie — see [Refreshing credentials](#refreshing-credentials)).
+
+### 8. Add the widget to your Noctalia bar
+
+Open the Noctalia settings UI, find the bar section you want the widget in (left / center / right), and add the `agent-usage` widget. Click the widget to open the panel.
+
+## Getting credentials
+
+All three providers authenticate by replaying cookies and tokens copied from a logged-in browser session. Open Chromium / Firefox DevTools (`F12`), log in to the provider, and capture from the **Network** tab.
+
+### Claude
+
+1. Log in to https://claude.ai/.
+2. DevTools → Network → reload the page.
+3. Click any request to `claude.ai` (e.g. the usage endpoint at `/api/organizations/.../usage` if you visit Settings → Usage).
+4. Under **Request Headers**, copy the entire `Cookie:` value.
+5. Paste it into `[sources.<name>.auth].cookie`.
+
+The poller extracts `sessionKey`, `lastActiveOrg`, `anthropic-device-id`, and `ajs_anonymous_id` from the cookie automatically. You can also set them individually under `[sources.<name>.auth]` as `session_key`, `organization_id`, `device_id`, `anonymous_id` if your cookie is missing one of them.
+
+### Codex (ChatGPT)
+
+1. Log in to https://chatgpt.com/.
+2. Visit https://chatgpt.com/codex/cloud/settings/analytics so a usage request fires.
+3. DevTools → Network → find the request to `/backend-api/wham/usage`.
+4. Under **Request Headers**:
+   - Copy the full `Authorization:` value (starts with `Bearer eyJ…`) into `[sources.<name>.auth].authorization`.
+   - Copy the full `Cookie:` value into `[sources.<name>.auth].cookie`.
+
+The poller derives `oai-did` and `oai-session-id` from the cookie. If your cookie is missing them you can supply `device_id` / `session_id` (and optionally `oai_session_id` for the header) directly under `[sources.<name>.auth]`.
+
+### Cursor
+
+1. Log in to https://cursor.com/.
+2. Visit https://cursor.com/dashboard/billing so the usage endpoint fires.
+3. DevTools → Network → find any request to `cursor.com/api/...`.
+4. Under **Request Headers**, copy the entire `Cookie:` value into `[sources.<name>.auth].cookie`.
+
+### Refreshing credentials
+
+Provider auth here is based on browser session tokens. They expire (Codex bearer tokens within hours, Claude/Cursor session cookies after days or weeks) and have to be refreshed manually by repeating the steps above. The service surfaces stale / expired sign-in state through the `status` field on each agent, but it cannot renew credentials for you. This is the main UX limitation of the current design.
 
 Legacy `.env` configuration is still read as a fallback when no TOML sources are configured. If both files exist, `config.toml` controls service settings and sources; explicit CLI overrides still win.
-
-Known limitation: provider auth here is based on copied browser cookies and session tokens. They expire and have to be refreshed manually. The service can surface stale or expired sign-in state, but it cannot renew credentials for you yet. This is a major UX limitation of the current design.
-
-4. Bootstrap the schema:
-
-```bash
-psql "postgresql://agent_usage:agent_usage@127.0.0.1:5433/agent_usage" < poller/schema.sql
-```
-
-5. Start the backend:
-
-```bash
-systemctl --user enable --now agent-usage-service.service
-systemctl --user enable --now agent-usage-poll.timer
-systemctl --user start agent-usage-poll.service
-```
 
 ## API
 

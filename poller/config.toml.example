@@ -5,6 +5,12 @@ port = 8785
 [poller]
 default_interval_seconds = 60
 
+# Replace <PG_PASSWORD> with the value generated during install (see README).
+# If you omit [storage].db_dsn the poller falls back to AGENT_USAGE_DB_DSN env
+# or the built-in default, neither of which is suitable for real use.
+[storage]
+db_dsn = "postgresql://agent_usage:<PG_PASSWORD>@127.0.0.1:5432/agent_usage"
+
 [frontend]
 columns = 3
 

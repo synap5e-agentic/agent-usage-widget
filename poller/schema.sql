@@ -1,6 +1,6 @@
 -- Schema for agent-usage-widget persistence.
 -- Bootstrap with:
---   psql "host=127.0.0.1 port=5433 dbname=agent_usage user=agent_usage" < poller/schema.sql
+--   psql "host=127.0.0.1 port=5432 dbname=agent_usage user=agent_usage" < poller/schema.sql
 
 CREATE TABLE IF NOT EXISTS usage_provider_fetch (
   id BIGSERIAL PRIMARY KEY,
