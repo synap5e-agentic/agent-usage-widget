@@ -6,9 +6,15 @@
 """Capture provider credentials (Claude / Codex / Cursor) via mitmproxy.
 
 Usage:
-    grab_provider_credentials.py                         # all three providers
-    grab_provider_credentials.py --target claude         # one
+    grab_provider_credentials.py                         # refresh only expired sources
+    grab_provider_credentials.py --target claude         # one provider (explicit)
     grab_provider_credentials.py --target claude --target codex
+
+With no --target/--write, the script probes every source in config.toml by
+making a live usage request with its stored creds, and only grabs the
+providers whose creds no longer authenticate (HTTP 401/403 or missing).
+Those are written back into their `[sources.<id>.auth]` table in place. If
+every source still authenticates, nothing is launched.
 
 The script self-launches mitmdump with this file as the addon. mitmdump
 listens on a random local port; a fresh red-themed Chrome profile is
@@ -320,6 +326,88 @@ def _collect_captures(capture_dir: Path, targets: list[str], timeout: float) -> 
     return seen
 
 
+def _import_poller_common():  # type: ignore[no-untyped-def]
+    """Import the poller's shared module (stdlib-only) to reuse its fetchers."""
+    poller_dir = Path(__file__).resolve().parent.parent / "poller"
+    if str(poller_dir) not in sys.path:
+        sys.path.insert(0, str(poller_dir))
+    import agent_usage_common  # type: ignore[import-not-found]
+
+    return agent_usage_common
+
+
+def _probe_source(common, cfg, source) -> str:  # type: ignore[no-untyped-def]
+    """Return 'valid', 'expired', or 'unknown' for a source's stored creds.
+
+    A live usage request is made with the stored creds: 200 means valid,
+    401/403 (or a header-build error from missing creds) means expired, and
+    anything else (network error, 5xx, rate limit) is unknown so we don't
+    grab needlessly.
+    """
+    try:
+        snapshot = common.run_fetch(cfg, source.provider, source=source)
+    except Exception as exc:  # missing/garbled creds usually fail header build
+        sys.stderr.write(f"[grab] {source.source_id}: probe error ({exc}); treating as expired\n")
+        return "expired"
+    if snapshot.success:
+        return "valid"
+    if snapshot.request_status in (401, 403):
+        return "expired"
+    return "unknown"
+
+
+def _select_expired_sources(config_path: Path) -> dict[str, str]:
+    """Probe every configured source; return {source_id: provider} for the ones
+    whose creds no longer authenticate.
+
+    Only one source per provider can be refreshed per run (one browser login
+    per host); extra expired sources sharing a provider are reported and left
+    for a follow-up run.
+    """
+    try:
+        common = _import_poller_common()
+    except Exception as exc:
+        sys.stderr.write(f"[grab] could not load poller for cred probe: {exc}\n")
+        raise SystemExit("[grab] pass --target/--write to grab specific providers instead")
+
+    try:
+        cfg = common.load_config(overrides={"AGENT_USAGE_CONFIG_FILE": str(config_path)})
+    except Exception as exc:
+        raise SystemExit(f"[grab] failed to load config {config_path}: {exc}")
+
+    expired: dict[str, str] = {}
+    claimed: dict[str, str] = {}  # provider -> first expired source_id chosen
+    for source in cfg.sources:
+        provider = source.provider
+        if provider not in PROVIDERS:
+            continue
+        verdict = _probe_source(common, cfg, source)
+        if verdict == "valid":
+            sys.stderr.write(f"[grab] {source.source_id} ({provider}): creds OK, skipping\n")
+            continue
+        if verdict == "unknown":
+            sys.stderr.write(
+                f"[grab] {source.source_id} ({provider}): could not verify creds "
+                "(network/server error); skipping\n"
+            )
+            continue
+        if provider in claimed:
+            sys.stderr.write(
+                f"[grab] {source.source_id} ({provider}): expired, but {claimed[provider]!r} "
+                f"is already queued for {provider}; rerun to refresh this one\n"
+            )
+            continue
+        claimed[provider] = source.source_id
+        expired[source.source_id] = provider
+        sys.stderr.write(f"[grab] {source.source_id} ({provider}): creds expired, will refresh\n")
+
+    if not cfg.sources:
+        sys.stderr.write("[grab] no [sources.*] in config; pass --target to grab a provider\n")
+    elif not expired:
+        sys.stderr.write("[grab] all configured sources still authenticate; nothing to refresh\n")
+    return expired
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -327,7 +415,8 @@ def main() -> int:
         action="append",
         choices=sorted(PROVIDERS),
         default=[],
-        help="Provider to capture; repeatable. Defaults to all providers.",
+        help="Provider to capture; repeatable. With none given, only sources "
+        "whose stored creds have expired are refreshed.",
     )
     parser.add_argument(
         "--timeout",
@@ -366,12 +455,17 @@ def main() -> int:
     if args.write:
         write_mapping = _load_write_mapping(config_path, args.write)
 
-    write_providers = set(write_mapping.values())
     target_providers = set(args.target or [])
-    if not target_providers and not write_providers:
-        targets = sorted(PROVIDERS)
-    else:
-        targets = sorted(target_providers | write_providers)
+
+    # No explicit targets: probe configured sources and only refresh the ones
+    # whose stored creds no longer authenticate, writing them back in place.
+    if not target_providers and not write_mapping:
+        write_mapping = _select_expired_sources(config_path)
+        if not write_mapping:
+            return 0
+
+    write_providers = set(write_mapping.values())
+    targets = sorted(target_providers | write_providers)
 
     # Reverse map: provider -> source_id (for writing back)
     provider_to_source = {provider: source_id for source_id, provider in write_mapping.items()}
