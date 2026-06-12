@@ -1,9 +1,9 @@
 [Unit]
-Description=Refresh agent usage state every minute
+Description=Refresh agent usage state every 5 minutes
 
 [Timer]
 OnBootSec=1min
-OnUnitActiveSec=1min
+OnUnitActiveSec=5min
 RandomizedDelaySec=30
 
 [Install]

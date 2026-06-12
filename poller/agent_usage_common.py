@@ -1988,15 +1988,26 @@ def sync_cursor_usage_events(
 
     if oldest_seen:
         synced_through = min(oldest_seen, known_through) if known_through else oldest_seen
-        client.update_cursor_usage_sync_state(
-            source_id=source_id,
-            cycle_start=cycle_start,
-            cycle_end=cycle_end,
-            synced_through_timestamp_ms=synced_through,
-            total_usage_events_count=total_events,
-            last_page_fetched=pages_fetched,
-            last_inserted_count=inserted_total,
+        # Only persist when the sync actually advanced. The row was previously
+        # rewritten (updated_at = now()) on every poll even when nothing changed;
+        # on this 3-row table that produces a dead tuple per poll, triggering
+        # autovacuum ~hourly and driving WAL/btrfs-metadata churn out of all
+        # proportion to the data. Skip the no-op write when state is unchanged.
+        state_changed = (
+            inserted_total > 0
+            or synced_through != known_through
+            or total_events != known_total
         )
+        if state_changed:
+            client.update_cursor_usage_sync_state(
+                source_id=source_id,
+                cycle_start=cycle_start,
+                cycle_end=cycle_end,
+                synced_through_timestamp_ms=synced_through,
+                total_usage_events_count=total_events,
+                last_page_fetched=pages_fetched,
+                last_inserted_count=inserted_total,
+            )
 
     return {
         "pages_fetched": pages_fetched,
